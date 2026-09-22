@@ -100,25 +100,29 @@ caller's responsibility.
 
 ### Characters and bytes
 
-Positions and lengths are in **characters**. What that costs at runtime depends entirely on
-the encoding, and the four split into two cases.
+Positions and lengths are in **characters**, but a `&str` is indexed by bytes. So each
+record is decoded into a buffer that is reused across rows, carrying a character-index to
+byte-offset table alongside the text. Extracting a field is then an O(1) slice borrowed
+from that buffer, rather than an allocation per field per row.
 
-**`cp1252`, `cp850`, `latin1` — nothing to convert.** These are single-byte encodings: one
-character is one byte for all 256 code points, with no exceptions. The schema's character
-numbers are therefore *already* byte offsets. There is no conversion step and no scanning —
-the record is sliced directly by byte index and each field decoded on its own. This is
-exact, not an approximation or a heuristic.
+All four encodings take the same path; the encoding only decides how the buffer is filled.
 
-**`utf8` — resolved per record.** Here the byte offset of character *N* depends on which
-characters precede it, so no fixed conversion exists to precompute: the same schema position
-lands at a different byte offset on every line. Each record is scanned once with
-`char_indices` to locate the boundaries the schema asks for, then sliced.
+- **An all-ASCII record** skips the offset table entirely — a character index *is* a byte
+  offset there, so a vectorized `is_ascii()` check sends it down a direct-index route. In a
+  mostly-ASCII file this is nearly every record, whichever encoding is declared.
+- **`cp1252`, `cp850`, `latin1`** decode byte by byte through a 256-entry table, recording
+  each character's offset as they go. One byte is always one character in these encodings,
+  so the table is a plain byte-to-character map with no decoding state to carry.
+- **`utf8`** walks `char_indices` for the boundaries. Here the byte offset of character *N*
+  genuinely depends on what precedes it, so nothing can be precomputed across records.
 
-One cheap win on that path — a record that happens to be entirely ASCII has byte offsets
-equal to its character offsets, so a vectorized `is_ascii()` check lets such a line take the
-direct-index route. In a mostly-ASCII UTF-8 file that is very nearly every line, which makes
-the scanning cost proportional to how much non-ASCII text the file actually contains rather
-than to its size.
+There is an alternative for the three single-byte encodings: because their character numbers
+are already byte offsets, the raw bytes could be sliced directly and only the fields the
+schema asks for decoded. That does less work whenever a record is much wider than the fields
+drawn from it. It is not what the code does, because avoiding an allocation per field then
+needs a separate decode buffer, and for layouts where the fields cover most of the record —
+the usual shape — the two are close. A layout that pulls a few short fields out of a very
+wide record is the case that would justify revisiting it.
 
 The reason to define the schema in characters rather than bytes is that it makes column
 positions transcoding-invariant. A file in any single-byte encoding and the same file
@@ -137,6 +141,13 @@ as two characters, and fixed-width data in practice does not.
 A Parquet file at `--out`, zstd-compressed, written in row-group batches as records are
 parsed so memory stays flat regardless of input size. An existing file at that path is
 overwritten without prompting.
+
+The write goes to a `.partial` file beside the destination and is renamed into place only
+once the footer is written. A run that fails partway therefore leaves an existing file at
+`--out` untouched, rather than having truncated it at startup — and never leaves a file
+that has row groups but no footer, which no reader can open. The partial file is removed on
+failure, and its name is unique, so concurrent runs against the same `--out` do not truncate
+or delete each other's work.
 
 Column types follow the schema: `Char` → Utf8, `Num` → Float64.
 
@@ -199,6 +210,29 @@ present yields the characters that are there. For `Num`, both cases then cast to
 endings within a file are fine. (`trim` would remove a stray `\r` from the final field
 anyway, but stripping it keeps character positions honest.)
 
+**A UTF-8 byte order mark** on the first record is stripped as bytes, before decoding. Left
+in place it shifts every field of that record, and `trim` does not remove it — U+FEFF is not
+whitespace — so it would otherwise reach Parquet and any join key downstream. Stripping it
+pre-decode also covers a BOM'd file read as cp1252, where those three bytes would otherwise
+become three visible characters.
+
+**A DOS end-of-file marker** (`0x1A`) at the end of the member is dropped, whether it
+trails the last record, sits on a line of its own, or falls between a carriage return and
+the end of the member. Like the BOM it survives `trim`, and it is worth handling because
+cp850 is the DOS codepage, so the two travel together. Only at the end of the member —
+elsewhere `0x1A` is treated as data, since nothing marks it as anything else.
+
+**Records must be newline delimited.** A member of fixed-length records run together with
+no terminators is out of scope. Reads are bounded — 8× the widest the schema's last field
+could occupy, or 64 KB, whichever is larger — so such a member fails once it passes that
+bound, without ever being pulled into memory whole.
+
+Below the bound it cannot be detected, and this is worth being plain about: a small member
+with no terminators is indistinguishable from one long record, because records longer than
+the schema's last field are legal and common. Such a member is read as a single row. The
+bound is what makes the realistic case loud, since an export that lost its terminators is
+not a few hundred bytes.
+
 The `max(position - 1 + length)` record length noted earlier is documentation only. With no
 length check and no warnings, nothing at runtime computes or consults it.
 
@@ -225,8 +259,9 @@ you would write against a natively-parsed frame.
 
 Exit code is `0` on success and non-zero on failure, so `check=True` behaves. Failures are
 things that make the run meaningless: unreadable zip, missing member, malformed schema,
-duplicate column name, unknown encoding, unwritable output path. Bad *values* are never a
-failure — they become `""` or null per the rules above.
+duplicate column name, unknown encoding, unwritable output path, a member with no line
+terminators, and text that is not valid UTF-8 under `--encoding utf8`. Bad *values* are
+never a failure — they become `""` or null per the rules above.
 
 ## Development
 
@@ -236,10 +271,12 @@ cargo build --release           # the binary lands in target/release/fwf
 python3 scripts/gen_tables.py   # regenerate src/tables.rs from Python's codecs
 ```
 
-`src/tables.rs` is generated and should not be hand-edited. The tests in `encoding.rs`
-check the properties that matter — latin-1 is the identity mapping, cp1252 diverges from it
-only across 0x80..=0x9F, and the three tables genuinely disagree in the high range — so a
-regeneration that went wrong would not pass quietly.
+`src/tables.rs` is generated and should not be hand-edited. `encoding.rs` pins every one of
+the 768 entries with a recorded FNV-1a digest per table, so any change from any cause — a
+hand edit, a regeneration that came out different — fails the test and has to be
+acknowledged deliberately by updating the digest. The property tests alongside it (latin-1
+is the identity mapping, cp1252 diverges only across 0x80..=0x9F) say what the tables mean;
+the digests are what make drift loud.
 
 Two pins worth knowing about. `polars` is held at 0.53 because the row-group and
 string-slicing behaviour documented above was read out of that version's source; moving it

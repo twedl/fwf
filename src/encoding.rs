@@ -25,6 +25,15 @@ pub enum Encoding {
 }
 
 impl Encoding {
+    /// The most bytes a single character can occupy in this encoding. Used only
+    /// to bound how long one record could legitimately be.
+    pub fn max_bytes_per_char(self) -> usize {
+        match self {
+            Encoding::Utf8 => 4,
+            Encoding::Cp1252 | Encoding::Cp850 | Encoding::Latin1 => 1,
+        }
+    }
+
     /// The byte-to-character table, or `None` for UTF-8, which has no such mapping.
     pub fn table(self) -> Option<&'static [char; 256]> {
         match self {
@@ -39,6 +48,71 @@ impl Encoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FNV-1a over every code point in a table.
+    ///
+    /// The targeted assertions below pin the entries that carry meaning, but they
+    /// leave most of each table unchecked — and `tables.rs` is generated, so a
+    /// regeneration that produced different output would otherwise pass in
+    /// silence. These digests are recorded by hand from tables verified against
+    /// Python's codecs, so any change to a single entry, from any cause, fails
+    /// here and has to be acknowledged deliberately.
+    fn digest(table: &[char; 256]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for character in table {
+            for byte in (*character as u32).to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn every_table_entry_is_pinned() {
+        assert_eq!(digest(&tables::CP1252), 0xbf23_881d_0be0_cf78, "cp1252 table changed");
+        assert_eq!(digest(&tables::CP850), 0x7161_c70c_005d_57a5, "cp850 table changed");
+        assert_eq!(digest(&tables::LATIN1), 0x8084_b7f6_c938_af25, "latin1 table changed");
+    }
+
+    /// cp850 is the one table with no arithmetic rule behind it, so a spread of
+    /// its upper half is checked explicitly — box drawing, shading, and letters.
+    #[test]
+    fn cp850_upper_half_decodes_correctly() {
+        for (byte, expected) in [
+            (0x80u8, '\u{00c7}'),
+            (0x82, '\u{00e9}'),
+            (0x9b, '\u{00f8}'),
+            (0xb0, '\u{2591}'),
+            (0xc5, '\u{253c}'),
+            (0xdb, '\u{2588}'),
+            (0xe1, '\u{00df}'),
+            (0xf1, '\u{00b1}'),
+            (0xff, '\u{00a0}'),
+        ] {
+            assert_eq!(tables::CP850[byte as usize], expected, "cp850 byte {byte:#04x}");
+        }
+    }
+
+    /// cp1252's C1 range is the part that distinguishes it from latin-1, and the
+    /// part a WHATWG-based decoder would get subtly different.
+    #[test]
+    fn cp1252_c1_range_decodes_correctly() {
+        for (byte, expected) in [
+            (0x80u8, '\u{20ac}'),
+            (0x82, '\u{201a}'),
+            (0x91, '\u{2018}'),
+            (0x92, '\u{2019}'),
+            (0x93, '\u{201c}'),
+            (0x94, '\u{201d}'),
+            (0x96, '\u{2013}'),
+            (0x97, '\u{2014}'),
+            (0x99, '\u{2122}'),
+            (0x9f, '\u{0178}'),
+        ] {
+            assert_eq!(tables::CP1252[byte as usize], expected, "cp1252 byte {byte:#04x}");
+        }
+    }
 
     #[test]
     fn utf8_has_no_table() {

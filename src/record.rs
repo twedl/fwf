@@ -22,6 +22,9 @@ pub struct Record {
 }
 
 impl Record {
+    // There is one construction site. A `Default` impl to satisfy the lint would
+    // add a second way to build this that nothing calls.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Record { text: String::new(), offsets: Vec::new(), ascii: true }
     }
@@ -82,12 +85,6 @@ impl Record {
                 None => self.text.len(),
             }
         }
-    }
-}
-
-impl Default for Record {
-    fn default() -> Self {
-        Record::new()
     }
 }
 

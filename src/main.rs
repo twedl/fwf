@@ -9,7 +9,7 @@ mod tables;
 mod writer;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -18,6 +18,27 @@ use clap::Parser;
 use crate::encoding::Encoding;
 use crate::record::Record;
 use crate::writer::Writer;
+
+/// A UTF-8 byte order mark. Stripped from the first record as bytes, before
+/// decoding: left in place it shifts every field of that record, and under a
+/// single-byte encoding it decodes to three visible characters rather than one.
+const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
+
+/// DOS end-of-file marker. Some members produced on DOS-era systems end with a
+/// stray 0x1A, which `trim` does not remove — it is not whitespace — so without
+/// this it would reach Parquet as a final one-character row.
+const DOS_EOF: u8 = 0x1a;
+
+/// Longest single record to read before giving up, as a multiple of the widest
+/// the schema's last field could occupy. Bounds memory when a member has no line
+/// terminators, while leaving generous room for records that run well past the
+/// last field the schema extracts — those are legal and must still parse.
+///
+/// Below this bound a member with no terminators cannot be told apart from one
+/// long record, and is read as one. Only the bound makes it detectable, which is
+/// enough in practice: an export with no terminators is not a few hundred bytes.
+const MAX_RECORD_MULTIPLE: usize = 8;
+const MIN_RECORD_CAP: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +71,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let fields = schema::load(&args.schema)?;
 
+    // Only used to bound a single read. Nothing validates a record against it.
+    // Converted to bytes via the encoding, so the margin means the same thing
+    // whether a character is one byte or four.
+    let record_length = fields.iter().map(schema::Field::end).max().unwrap_or(0);
+    let cap = record_length
+        .saturating_mul(args.encoding.max_bytes_per_char())
+        .saturating_mul(MAX_RECORD_MULTIPLE)
+        .max(MIN_RECORD_CAP) as u64;
+
     let file = File::open(&args.zip)
         .with_context(|| format!("opening {}", args.zip.display()))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -63,7 +93,7 @@ fn main() -> Result<()> {
             "no member `{}` in {}; archive contains: {}",
             args.member,
             args.zip.display(),
-            names.join(", ")
+            summarize(&names)
         );
     }
     let member = archive
@@ -78,17 +108,51 @@ fn main() -> Result<()> {
 
     loop {
         line.clear();
-        // Not `.lines()`: the bytes are not UTF-8 until we decode them ourselves.
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        // Not `.lines()`: these bytes are not UTF-8 until we decode them. The
+        // `take` bounds one record, so a member with no terminators fails here
+        // instead of being pulled into memory whole and parsed as a single row.
+        let read = reader.by_ref().take(cap).read_until(b'\n', &mut line)?;
+        if read == 0 {
             break;
         }
+        let terminated = line.last() == Some(&b'\n');
+        if terminated {
+            line.pop();
+        } else if read as u64 == cap {
+            bail!(
+                "`{}` reached {cap} bytes with no line terminator. Records must be \
+                 newline delimited; a member of fixed-length records run together \
+                 with no terminators is not supported.",
+                args.member
+            );
+        }
+
+        // Whether anything follows this record. Peeking the buffer answers that
+        // directly, rather than inferring it from whether a terminator was
+        // found — which only tells you about the last read, not the member.
+        let at_end = reader.fill_buf()?.is_empty();
+
+        if at_end {
+            // At the very end of a member a carriage return and a DOS end-of-file
+            // marker can sit in either order — `...\r\x1a` and `\x1a\r` both occur
+            // — and neither is data. Anywhere else, a lone 0x1A is data and stays.
+            while matches!(line.last(), Some(&(DOS_EOF | b'\r'))) {
+                line.pop();
+            }
+            // Nothing left once that came off: this was the member's tail, not a
+            // record.
+            if line.is_empty() {
+                break;
+            }
+        } else if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+
         line_number += 1;
-        if line.last() == Some(&b'\n') {
-            line.pop();
+        if line_number == 1 && line.starts_with(&BOM) {
+            line.drain(..BOM.len());
         }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
+
         record
             .fill(&line, args.encoding)
             .with_context(|| format!("line {line_number}"))?;
@@ -98,6 +162,20 @@ fn main() -> Result<()> {
     let rows = writer.finish()?;
     eprintln!("wrote {} ({} rows)", args.out.display(), thousands(rows));
     Ok(())
+}
+
+/// Archive listings go into an error message that a Python caller captures from
+/// stderr, so a typo against a large archive must not emit megabytes of names.
+fn summarize(names: &[String]) -> String {
+    const MAX: usize = 20;
+    if names.len() <= MAX {
+        return names.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        names[..MAX].join(", "),
+        names.len() - MAX
+    )
 }
 
 fn thousands(n: usize) -> String {
@@ -114,7 +192,7 @@ fn thousands(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::thousands;
+    use super::{summarize, thousands};
 
     #[test]
     fn groups_digits_in_threes() {
@@ -127,5 +205,19 @@ mod tests {
         ] {
             assert_eq!(thousands(n), want);
         }
+    }
+
+    #[test]
+    fn lists_every_name_when_there_are_few() {
+        let names = vec!["a.dat".to_string(), "b.dat".to_string()];
+        assert_eq!(summarize(&names), "a.dat, b.dat");
+    }
+
+    #[test]
+    fn caps_a_long_archive_listing() {
+        let names: Vec<String> = (0..500).map(|i| format!("member{i:03}.dat")).collect();
+        let summary = summarize(&names);
+        assert!(summary.ends_with("and 480 more"), "got: {summary}");
+        assert!(summary.len() < 400, "listing should stay short, got {} bytes", summary.len());
     }
 }
