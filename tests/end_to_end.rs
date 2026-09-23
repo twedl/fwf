@@ -22,8 +22,24 @@ use tempfile::TempDir;
 /// city    _ prov _ amount
 /// 1....8  9 10.11 12 13......22
 /// ```
-const SCHEMA: &str =
-    r#"[["city", 1, 8, "Char"], ["prov", 10, 2, "Char"], ["amount", 13, 10, "Num"]]"#;
+const SCHEMA: &str = r#"[
+    {"name": "city",   "at": [1, 8],   "type": "String"},
+    {"name": "prov",   "at": [10, 2],  "type": "String"},
+    {"name": "amount", "at": [13, 10], "type": "Float64"}
+]"#;
+
+/// The typed columns, plus one the record does not carry at all.
+///
+/// ```text
+/// city    _ count _ opened
+/// 1....8  9 10.13 14 15....22    region: declared, never read
+/// ```
+const TYPED_SCHEMA: &str = r#"[
+    {"name": "city",   "at": [1, 8],  "type": "String"},
+    {"name": "count",  "at": [10, 4], "type": "Int64"},
+    {"name": "opened", "at": [15, 8], "type": "Date", "format": "%Y%m%d"},
+    {"name": "region", "type": "String"}
+]"#;
 
 struct Fixture {
     dir: TempDir,
@@ -101,8 +117,12 @@ impl Fixture {
     }
 
     fn parse_as(&self, encoding: &str, body: &[u8]) -> DataFrame {
+        self.parse_with(SCHEMA, encoding, body)
+    }
+
+    fn parse_with(&self, schema: &str, encoding: &str, body: &[u8]) -> DataFrame {
         let zip = self.zip(&[("records.dat", body)]);
-        let schema = self.schema(SCHEMA);
+        let schema = self.schema(schema);
         self.run(&zip, "records.dat", &schema, encoding).frame().clone()
     }
 }
@@ -150,6 +170,17 @@ fn strings(frame: &DataFrame, name: &str) -> Vec<Option<String>> {
 
 fn floats(frame: &DataFrame, name: &str) -> Vec<Option<f64>> {
     frame.column(name).unwrap().f64().unwrap().into_iter().collect()
+}
+
+fn ints(frame: &DataFrame, name: &str) -> Vec<Option<i64>> {
+    frame.column(name).unwrap().i64().unwrap().into_iter().collect()
+}
+
+/// Dates come back as the days-since-epoch a Date32 physically holds, which is
+/// what the column is — reading it as anything else would test the conversion
+/// rather than the stored value.
+fn dates(frame: &DataFrame, name: &str) -> Vec<Option<i32>> {
+    frame.column(name).unwrap().date().unwrap().physical().into_iter().collect()
 }
 
 fn some(values: &[&str]) -> Vec<Option<String>> {
@@ -223,6 +254,82 @@ fn a_blank_char_field_is_an_empty_string_not_null() {
 fn an_unparseable_num_field_is_null() {
     let frame = Fixture::new().parse(b"TORONTO  ON     ***.**\nTORONTO  ON          \n");
     assert_eq!(floats(&frame, "amount"), vec![None, None]);
+}
+
+#[test]
+fn typed_columns_land_with_the_declared_dtypes() {
+    let frame = Fixture::new().parse_with(TYPED_SCHEMA, "cp1252", b"TORONTO  0042 19700102\n");
+    assert_eq!(names(&frame), vec!["city", "count", "opened", "region"]);
+    assert_eq!(
+        frame.dtypes(),
+        vec![DataType::String, DataType::Int64, DataType::Date, DataType::String]
+    );
+}
+
+#[test]
+fn an_int64_field_parses_whole_numbers_and_nulls_the_rest() {
+    let body = [
+        "TORONTO  0042 19700102",
+        "TORONTO  -7   19700102",
+        // A decimal point and a blank are both rejections, not truncations.
+        "TORONTO  12.5 19700102",
+        "TORONTO       19700102",
+    ]
+    .join("\n");
+    let frame = Fixture::new().parse_with(TYPED_SCHEMA, "cp1252", body.as_bytes());
+    assert_eq!(ints(&frame, "count"), vec![Some(42), Some(-7), None, None]);
+}
+
+#[test]
+fn a_date_field_parses_with_its_format_and_nulls_what_it_cannot() {
+    let body = [
+        "TORONTO  0001 19700101",
+        "TORONTO  0002 19700102",
+        "TORONTO  0003 19691231",
+        "TORONTO  0004 not-date",
+        "TORONTO  0005         ",
+    ]
+    .join("\n");
+    let frame = Fixture::new().parse_with(TYPED_SCHEMA, "cp1252", body.as_bytes());
+    assert_eq!(dates(&frame, "opened"), vec![Some(0), Some(1), Some(-1), None, None]);
+}
+
+/// Each Date field carries its own format, so one member can hold date fields
+/// that disagree about how a date is written — as layouts of any age do.
+#[test]
+fn date_formats_are_per_field() {
+    let schema = r#"[
+        {"name": "long",  "at": [1, 8],  "type": "Date", "format": "%Y%m%d"},
+        {"name": "short", "at": [10, 6], "type": "Date", "format": "%y%m%d"}
+    ]"#;
+    let frame = Fixture::new().parse_with(schema, "cp1252", b"19700102 700103\n");
+    assert_eq!(dates(&frame, "long"), vec![Some(1)]);
+    assert_eq!(dates(&frame, "short"), vec![Some(2)]);
+}
+
+#[test]
+fn a_column_the_record_does_not_carry_is_all_null() {
+    let body = ["TORONTO  0042 19700102", "OTTAWA   0007 19700103"].join("\n");
+    let frame = Fixture::new().parse_with(TYPED_SCHEMA, "cp1252", body.as_bytes());
+
+    assert_eq!(strings(&frame, "region"), vec![None, None]);
+    assert_eq!(frame.column("region").unwrap().null_count(), 2);
+    // The columns that are read are untouched by the one that is not.
+    assert_eq!(strings(&frame, "city"), some(&["TORONTO", "OTTAWA"]));
+    assert_eq!(ints(&frame, "count"), vec![Some(42), Some(7)]);
+}
+
+/// Nothing in such a schema says how long a record is, so the read bound falls
+/// back to its floor instead of being computed as zero — which would fail every
+/// record for want of a terminator.
+#[test]
+fn a_schema_of_only_absent_columns_still_runs() {
+    let schema = r#"[{"name": "a", "type": "String"}, {"name": "b", "type": "Int64"}]"#;
+    let frame = Fixture::new().parse_with(schema, "cp1252", b"anything at all\nand more\n");
+
+    assert_eq!(frame.height(), 2);
+    assert_eq!(strings(&frame, "a"), vec![None, None]);
+    assert_eq!(ints(&frame, "b"), vec![None, None]);
 }
 
 #[test]
@@ -473,7 +580,10 @@ fn a_missing_member_fails_and_names_what_the_archive_holds() {
 fn a_bad_schema_fails_before_writing_anything() {
     let fixture = Fixture::new();
     let zip = fixture.zip(&[("records.dat", b"x" as &[u8])]);
-    let schema = fixture.schema(r#"[["a", 1, 4, "Char"], ["a", 6, 4, "Num"]]"#);
+    let schema = fixture.schema(
+        r#"[{"name": "a", "at": [1, 4], "type": "String"},
+            {"name": "a", "at": [6, 4], "type": "Float64"}]"#,
+    );
     let out = fixture.path("never.parquet");
     let run = fixture.run_to(&out, &zip, "records.dat", &schema, "cp1252");
 

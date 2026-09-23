@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 
 use crate::encoding::Encoding;
-use crate::schema::Field;
+use crate::schema::Span;
 
 pub struct Record {
     text: String,
@@ -66,9 +66,9 @@ impl Record {
         Ok(())
     }
 
-    /// The text of one field, trimmed by the caller.
-    pub fn field(&self, field: &Field) -> &str {
-        &self.text[self.byte_of(field.start())..self.byte_of(field.end())]
+    /// The text at one span, trimmed by the caller.
+    pub fn field(&self, at: &Span) -> &str {
+        &self.text[self.byte_of(at.start())..self.byte_of(at.end())]
     }
 
     /// Byte offset of a character index, clamped to the end of the record.
@@ -91,16 +91,15 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::Kind;
 
-    fn field(position: usize, length: usize) -> Field {
-        Field { name: "f".into(), position, length, kind: Kind::Char }
+    fn span(position: usize, length: usize) -> Span {
+        Span { position, length }
     }
 
     fn slice(raw: &[u8], encoding: Encoding, position: usize, length: usize) -> String {
         let mut record = Record::new();
         record.fill(raw, encoding).unwrap();
-        record.field(&field(position, length)).to_string()
+        record.field(&span(position, length)).to_string()
     }
 
     #[test]
@@ -163,10 +162,10 @@ mod tests {
     fn the_buffer_is_reusable_across_records() {
         let mut record = Record::new();
         record.fill("PRÉCÉDENT".as_bytes(), Encoding::Utf8).unwrap();
-        assert_eq!(record.field(&field(1, 3)), "PRÉ");
+        assert_eq!(record.field(&span(1, 3)), "PRÉ");
 
         record.fill(b"PLAIN", Encoding::Utf8).unwrap();
-        assert_eq!(record.field(&field(1, 3)), "PLA");
-        assert_eq!(record.field(&field(4, 99)), "IN");
+        assert_eq!(record.field(&span(1, 3)), "PLA");
+        assert_eq!(record.field(&span(4, 99)), "IN");
     }
 }
