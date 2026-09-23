@@ -54,7 +54,7 @@ struct Args {
     #[arg(long, value_name = "NAME")]
     member: String,
 
-    /// Path to the JSON schema: [[name, position, length, "Char"|"Num"], ...].
+    /// Path to the JSON schema: [{"name": .., "at": [position, length], "type": ..}, ...].
     #[arg(long, value_name = "PATH")]
     schema: PathBuf,
 
@@ -73,8 +73,14 @@ fn main() -> Result<()> {
 
     // Only used to bound a single read. Nothing validates a record against it.
     // Converted to bytes via the encoding, so the margin means the same thing
-    // whether a character is one byte or four.
-    let record_length = fields.iter().map(schema::Field::end).max().unwrap_or(0);
+    // whether a character is one byte or four. Columns the record does not carry
+    // have no span and so say nothing about how long a record is; a schema of
+    // nothing but those falls back to the floor below.
+    let record_length = fields
+        .iter()
+        .filter_map(|field| field.at.as_ref().map(schema::Span::end))
+        .max()
+        .unwrap_or(0);
     let cap = record_length
         .saturating_mul(args.encoding.max_bytes_per_char())
         .saturating_mul(MAX_RECORD_MULTIPLE)

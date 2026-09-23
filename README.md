@@ -57,39 +57,51 @@ present.
 
 ### The schema
 
-A JSON array of 4-element arrays — `[name, position, length, type]` — positional, not
-keyed. This is what `json.dump` produces from a Python list of tuples, which is where
-these come from. Order determines column order in the output.
+A JSON array of objects, one per output column. It is an **output** schema: it declares
+the columns of the Parquet file, in order, and where in the record each one is read from.
+This is what `json.dump` produces from a Python list of dicts, which is where these come
+from. Order determines column order in the output.
 
 An example, not a fixed layout — any set of fields is valid:
 
 ```json
 [
-  ["record_type",  1,  2,  "Char"],
-  ["id",           4,  12, "Char"],
-  ["region",       17, 3,  "Char"],
-  ["description",  21, 40, "Char"],
-  ["weight",       62, 13, "Num"],
-  ["amount",       76, 13, "Num"]
+  {"name": "record_type", "at": [1, 2],   "type": "String"},
+  {"name": "id",          "at": [4, 12],  "type": "String"},
+  {"name": "region",      "at": [17, 3],  "type": "String"},
+  {"name": "count",       "at": [21, 6],  "type": "Int64"},
+  {"name": "opened",      "at": [28, 8],  "type": "Date", "format": "%Y%m%d"},
+  {"name": "amount",      "at": [76, 13], "type": "Float64"},
+  {"name": "retired",     "type": "Date", "format": "%Y%m%d"}
 ]
 ```
 
-| Position | Type   | Meaning                                                      |
-| -------- | ------ | ------------------------------------------------------------ |
-| 0        | string | Output column name. Must be unique.                           |
-| 1        | int    | 1-based **character** offset of the field's first character.  |
-| 2        | int    | Field length in **characters**.                               |
-| 3        | string | `Char` or `Num`.                                              |
+| Key      | Required           | Meaning                                                  |
+| -------- | ------------------ | -------------------------------------------------------- |
+| `name`   | yes                | Output column name. Must be unique.                       |
+| `at`     | no                 | `[position, length]` — 1-based **character** offset of the field's first character, and its length in **characters**. Omitted, the column is never read. |
+| `type`   | yes                | `String`, `Float64`, `Int64`, or `Date` — polars' own dtype names. |
+| `format` | `Date` only        | A chrono/`strftime` pattern, such as `%Y%m%d`. Required on `Date`, rejected on every other type. |
 
-Any element that is not a 4-element array, or whose type is not exactly `Char` or `Num`,
-is an error.
+Unknown keys, missing `name` or `type`, an unknown type, a duplicate name, a position or
+length below 1, an `at` that is not exactly two numbers, a `Date` with no `format`, and a
+`format` on a non-`Date` are each an error, reported before any output is written.
+
+Because a column's name is simply the name it is given, renaming is not a separate
+feature: write the name you want the Parquet column to have.
+
+**A column with no `at`** is declared and typed but never read, and comes out all null.
+That is what lets extracts of layouts that disagree about which fields exist share one
+Parquet schema, so the files union cleanly — a field absent from one vintage is declared
+there and null-filled, rather than missing from that file's schema.
 
 The schema need not cover the whole record, and typically does not — layouts often leave
 a character or two between fields. Unlisted characters are simply not read. Overlapping
 fields are also allowed; the same characters may feed two columns.
 
-The implied record length is `max(position - 1 + length)` — 88 characters for the six
-fields above. It is descriptive only; nothing validates a record against it.
+The implied record length is `max(position - 1 + length)` over the fields that have an
+`at` — 88 characters for the example above. It is descriptive only; nothing validates a
+record against it.
 
 ### The encoding
 
@@ -149,16 +161,28 @@ that has row groups but no footer, which no reader can open. The partial file is
 failure, and its name is unique, so concurrent runs against the same `--out` do not truncate
 or delete each other's work.
 
-Column types follow the schema: `Char` → Utf8, `Num` → Float64.
+Column types follow the schema, and there is nothing to look up: the schema's type names
+**are** polars' dtype names, so `Float64` in the schema is `pl.Float64` in the frame. The
+only one worth spelling out is `Date`, which is a Date32 — whole days from 1970-01-01,
+negative before it.
 
-`Num` is Float64 rather than Int64 because that is what `cast(pl.Float64, strict=False)`
-gives — it is fidelity, not a judgement call. It also happens to be lossless at realistic
-field lengths: 13 characters tops out at 9,999,999,999,999, well under the 2^53 bound below
-which Float64 holds every integer exactly. A `Num` field wider than 15 characters could
-exceed that and lose precision. Cast to Int64 in Python if a column is known to be integral.
+The vocabulary is polars' rather than the fixed-width world's `Char`/`Num` on purpose.
+Every type here is *defined* as the polars expression it reproduces (see Parsing
+semantics), so naming them anything else would put a translation step between what the
+schema says and what it does.
 
-`Char` columns never contain null — a blank field is `""`. `Num` columns are the only
-source of nulls. Both are written as nullable Parquet columns regardless.
+**Choosing between `Float64` and `Int64`** is the one real decision. `Float64` is lossless
+at realistic field lengths — 13 characters tops out at 9,999,999,999,999, well under the
+2^53 bound below which Float64 holds every integer exactly — but a numeric field wider than
+15 characters could exceed that and lose precision. `Int64` is exact to 19 digits, and
+rejects rather than rounds: `12.5` in an `Int64` column is null, not 12. Prefer `Int64` for
+a column known to be integral, and `Float64` when a value may carry a decimal point.
+
+A `String` column that is read never contains null — a blank field is `""`. `Float64`,
+`Int64`, and `Date` columns are null wherever the text did not parse. A column with no `at`
+is null throughout, whatever its type — so a `String` column *can* be null, but only that
+way, never from a blank field. All columns are written as nullable Parquet columns
+regardless.
 
 ### Row groups
 
@@ -179,30 +203,53 @@ it is worth re-checking on a polars upgrade.
 The rule is fidelity to polars. This tool exists because polars cannot decode cp1252,
 cp850, or latin1 — not because it slices fixed-width fields differently. So every field is
 defined to produce exactly what the equivalent polars expression would, given the same
-record as a string:
+record as a string. The schema's type names are these expressions' target dtypes, which is
+why they are polars' names and not fixed-width ones:
 
 ```python
-# Char
+# String
 pl.col("raw").str.slice(position - 1, length).str.strip_chars().alias(name)
 
-# Num
+# Float64
 pl.col("raw").str.slice(position - 1, length).str.strip_chars()
   .cast(pl.Float64, strict=False).alias(name)
+
+# Int64
+pl.col("raw").str.slice(position - 1, length).str.strip_chars()
+  .cast(pl.Int64, strict=False).alias(name)
+
+# Date
+pl.col("raw").str.slice(position - 1, length).str.strip_chars()
+  .str.to_date(format, strict=False).alias(name)
 ```
 
 Everything below follows from that, and is stated only because it is easy to get wrong:
 
-**`Char`** fields are trimmed with Rust's `str::trim` — which is what `strip_chars()` with
+**`String`** fields are trimmed with Rust's `str::trim` — which is what `strip_chars()` with
 no pattern reduces to (`polars-ops` `namespace.rs:477`). An entirely blank field becomes
-`""`, **not** null. A `Char` column is therefore never null.
+`""`, **not** null. A `String` column that is read is therefore never null.
 
-**`Num`** fields are trimmed and then parsed as Float64. Empty or unparseable text becomes
-null, matching `strict=False`. Null in a `Num` column is the only null this tool produces.
+**`Float64`** fields are trimmed and then parsed as a double. Empty or unparseable text
+becomes null, matching `strict=False`.
+
+**`Int64`** fields are trimmed and then parsed as i64. A decimal point, an exponent, or a
+value past i64's range is unparseable and becomes null — an `Int64` field never rounds or
+truncates to reach a number. `0042` is 42; `12.5` is null, not 12.
+
+**`Date`** fields are trimmed and then parsed with the field's own `format`, a chrono
+`strftime` pattern — the same patterns polars' `to_date` takes, since both go through
+chrono. Text that does not match becomes null. The stored value is a Date32: whole days
+from 1970-01-01, negative before it. Each `Date` field carries its own format, so one
+member may hold date fields written different ways.
+
+**A column with no `at`** reads nothing and is null in every row, whatever its type. This
+is the only way a `String` column becomes null.
 
 **Short lines** are kept as-is, with no length check at all. A field that begins past the
 end of the record yields `""` — polars' `substring_ternary_offsets_value` returns an empty
 range when the offset is out of bounds, rather than null. A field that is only partly
-present yields the characters that are there. For `Num`, both cases then cast to null.
+present yields the characters that are there. For `Float64`, `Int64`, and `Date`, both cases
+then parse to null.
 
 **Long lines** are kept and the trailing characters ignored.
 
@@ -284,14 +331,26 @@ means re-checking those notes. `sysinfo`, which arrives transitively through `po
 is pinned in `Cargo.lock` to the newest release that still builds on Rust 1.94 — newer ones
 require 1.95.
 
+Two notes on the `Date` type. Polars gates the *logical* type rather than the enum variant,
+so `DataType::Date` compiles without the `dtype-date` feature and panics on first use;
+the feature is enabled in `Cargo.toml` and is not optional. And a `Date` column holds its
+format pre-lexed as `Vec<Item>` rather than calling `NaiveDate::parse_from_str` per row,
+which would rebuild `StrftimeItems` and re-lex the format string on every record: over 2M
+rows that measured 140ms against 80ms, about 40% of the date column's cost. The pre-lexing
+happens once per batch, in `ColumnBuilder::new`.
+
 ## Non-goals
 
 Deliberately absent, to keep this small:
 
 - Schema inference, encoding detection, member globbing.
-- Any type beyond `Char` and `Num` — no booleans, dates, or implied-decimal scaling, and
-  no integer type. Cast in Python if needed.
-- Column subsetting or renaming beyond what the schema already expresses.
+- Any type beyond `String`, `Float64`, `Int64`, and `Date`. The names are polars' own, but
+  the set is not open: `Boolean`, `Int32`, `Datetime` and the rest are rejected, because
+  each would need its own documented parse rule and none has been asked for. No
+  implied-decimal scaling either — scaling is arithmetic rather than a cast, so it has no
+  polars string-cast equivalent to be faithful to. Do it in Python.
+- Column subsetting or reordering beyond what the schema already expresses. (Renaming needs
+  no feature: a column's name is whatever the schema calls it.)
 - A separate UTF-8 path that slices via polars expressions rather than parsing by hand.
   The output would be identical — that is the point of the semantics above — so it would
   buy nothing but a second code path. Polars has no fixed-width reader, so it would mean a

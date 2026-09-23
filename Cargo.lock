@@ -917,8 +917,10 @@ name = "fwf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "polars",
+ "serde",
  "serde_json",
  "tempfile",
  "zip",
@@ -1704,6 +1706,7 @@ dependencies = [
  "polars-ops",
  "polars-parquet",
  "polars-sql",
+ "polars-time",
  "polars-utils",
  "version_check",
 ]
@@ -1912,6 +1915,7 @@ dependencies = [
  "polars-error",
  "polars-parquet",
  "polars-schema",
+ "polars-time",
  "polars-utils",
  "rayon",
  "regex",

@@ -5,6 +5,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::format::{Item, Parsed, StrftimeItems};
+use chrono::NaiveDate;
 use polars::prelude::*;
 use tempfile::NamedTempFile;
 
@@ -23,41 +25,97 @@ use crate::schema::{Field, Kind};
 pub const BATCH_ROWS: usize = 512 * 512;
 
 enum ColumnBuilder {
-    Char(StringChunkedBuilder),
-    Num(PrimitiveChunkedBuilder<Float64Type>),
+    String(StringChunkedBuilder),
+    Float64(PrimitiveChunkedBuilder<Float64Type>),
+    Int64(PrimitiveChunkedBuilder<Int64Type>),
+    /// Holds the format already broken into items. `NaiveDate::parse_from_str`
+    /// would re-lex the format string on every row — it builds a fresh
+    /// `StrftimeItems` per call — and the format is identical for every row of
+    /// a column, so it is lexed once per batch here instead.
+    Date(PrimitiveChunkedBuilder<Int32Type>, Vec<Item<'static>>),
 }
 
 impl ColumnBuilder {
     fn new(field: &Field, capacity: usize) -> Self {
         let name: PlSmallStr = field.name.as_str().into();
-        match field.kind {
-            Kind::Char => ColumnBuilder::Char(StringChunkedBuilder::new(name, capacity)),
-            Kind::Num => ColumnBuilder::Num(PrimitiveChunkedBuilder::new(name, capacity)),
+        match &field.kind {
+            Kind::String => ColumnBuilder::String(StringChunkedBuilder::new(name, capacity)),
+            Kind::Float64 => ColumnBuilder::Float64(PrimitiveChunkedBuilder::new(name, capacity)),
+            Kind::Int64 => ColumnBuilder::Int64(PrimitiveChunkedBuilder::new(name, capacity)),
+            // A format that does not lex leaves no items, which parses nothing
+            // and so nulls every row — the same outcome a per-row parse against
+            // an unusable format already produced.
+            Kind::Date(format) => ColumnBuilder::Date(
+                PrimitiveChunkedBuilder::new(name, capacity),
+                StrftimeItems::new(format).parse_to_owned().unwrap_or_default(),
+            ),
         }
     }
 
-    /// Append one field's text, applying the polars-equivalent semantics:
-    /// `str.strip_chars()` for `Char`, and `.cast(Float64, strict=False)` after
-    /// the same trim for `Num`.
+    /// Append one field's text, applying the polars-equivalent semantics: every
+    /// type is trimmed with `str.strip_chars()`, and then `String` keeps the
+    /// text, `Float64` and `Int64` apply `.cast(…, strict=False)`, and `Date`
+    /// applies `.str.to_date(format, strict=False)`.
     fn push(&mut self, raw: &str) {
         let value = raw.trim();
         match self {
             // A blank field is "", never null — matching strip_chars().
-            ColumnBuilder::Char(builder) => builder.append_value(value),
-            // Empty or unparseable is null — matching strict=False.
-            ColumnBuilder::Num(builder) => match value.parse::<f64>() {
+            ColumnBuilder::String(builder) => builder.append_value(value),
+            // Empty or unparseable is null — matching strict=False. The same
+            // rule covers the three parsed types; only the parser differs.
+            ColumnBuilder::Float64(builder) => match value.parse::<f64>() {
                 Ok(number) => builder.append_value(number),
                 Err(_) => builder.append_null(),
             },
+            // Rust's i64 parser rejects what a strict Int64 cast rejects: a
+            // decimal point, an exponent, or anything past i64's range.
+            ColumnBuilder::Int64(builder) => match value.parse::<i64>() {
+                Ok(number) => builder.append_value(number),
+                Err(_) => builder.append_null(),
+            },
+            ColumnBuilder::Date(builder, items) => {
+                // What `NaiveDate::parse_from_str` does, minus re-lexing the
+                // format: drive the pre-lexed items over this row's text.
+                let mut parsed = Parsed::new();
+                let date = chrono::format::parse(&mut parsed, value, items.iter())
+                    .and_then(|()| parsed.to_naive_date());
+                match date {
+                    Ok(date) => builder.append_value(days_since_epoch(date)),
+                    Err(_) => builder.append_null(),
+                }
+            }
+        }
+    }
+
+    /// Append the null that stands in for a column the record does not carry.
+    fn push_null(&mut self) {
+        match self {
+            ColumnBuilder::String(builder) => builder.append_null(),
+            ColumnBuilder::Float64(builder) => builder.append_null(),
+            ColumnBuilder::Int64(builder) => builder.append_null(),
+            ColumnBuilder::Date(builder, _) => builder.append_null(),
         }
     }
 
     fn finish(self) -> Column {
         match self {
-            ColumnBuilder::Char(builder) => builder.finish().into_series().into_column(),
-            ColumnBuilder::Num(builder) => builder.finish().into_series().into_column(),
+            ColumnBuilder::String(builder) => builder.finish().into_series().into_column(),
+            ColumnBuilder::Float64(builder) => builder.finish().into_series().into_column(),
+            ColumnBuilder::Int64(builder) => builder.finish().into_series().into_column(),
+            // The Int32 days are reinterpreted as a Date rather than cast: the
+            // numbers are already what a Date32 holds.
+            ColumnBuilder::Date(builder, _) => {
+                builder.finish().into_date().into_series().into_column()
+            }
         }
     }
+}
+
+/// chrono's date range tops out near ±262,000 years — under 100 million days —
+/// so every date it can parse fits in the i32 a Date32 stores.
+fn days_since_epoch(date: NaiveDate) -> i32 {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
+    (date - epoch).num_days() as i32
 }
 
 pub struct Writer {
@@ -79,9 +137,14 @@ impl Writer {
         let schema = Schema::from_iter(fields.iter().map(|field| {
             polars::prelude::Field::new(
                 field.name.as_str().into(),
+                // An identity mapping, and meant to stay one: the schema's type
+                // names are polars' own, so this is a change of representation
+                // rather than a translation between two vocabularies.
                 match field.kind {
-                    Kind::Char => DataType::String,
-                    Kind::Num => DataType::Float64,
+                    Kind::String => DataType::String,
+                    Kind::Float64 => DataType::Float64,
+                    Kind::Int64 => DataType::Int64,
+                    Kind::Date(_) => DataType::Date,
                 },
             )
         }));
@@ -137,7 +200,10 @@ impl Writer {
 
     pub fn push(&mut self, record: &Record) -> Result<()> {
         for (field, builder) in self.fields.iter().zip(self.builders.iter_mut()) {
-            builder.push(record.field(field));
+            match &field.at {
+                Some(at) => builder.push(record.field(at)),
+                None => builder.push_null(),
+            }
         }
         self.rows_in_batch += 1;
         self.total_rows += 1;
@@ -177,5 +243,23 @@ impl Writer {
             format!("moving the finished file into place at {}", self.destination.display())
         })?;
         Ok(self.total_rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the sign and the origin of the stored value: a Date32 counts days
+    /// from 1970-01-01 and goes negative before it, which is easy to get subtly
+    /// wrong and impossible to see in a Parquet file afterwards.
+    #[test]
+    fn dates_convert_to_days_since_the_epoch() {
+        let day = |text| NaiveDate::parse_from_str(text, "%Y%m%d").unwrap();
+        assert_eq!(days_since_epoch(day("19700101")), 0);
+        assert_eq!(days_since_epoch(day("19700102")), 1);
+        assert_eq!(days_since_epoch(day("19691231")), -1);
+        // A leap day, past which a naive 365-day arithmetic would drift.
+        assert_eq!(days_since_epoch(day("20000301")), 11017);
     }
 }
