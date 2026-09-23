@@ -333,9 +333,11 @@ require 1.95.
 
 Two notes on the `Date` type. Polars gates the *logical* type rather than the enum variant,
 so `DataType::Date` compiles without the `dtype-date` feature and panics on first use;
-the feature is enabled in `Cargo.toml` and is not optional. And `writer.rs` carries one
-number transcribed from chrono — `EPOCH_DAYS_FROM_CE`, chrono's own `UNIX_EPOCH_DAY` — with
-a unit test that checks it against dates chrono actually parses rather than trusting it.
+the feature is enabled in `Cargo.toml` and is not optional. And a `Date` column holds its
+format pre-lexed as `Vec<Item>` rather than calling `NaiveDate::parse_from_str` per row,
+which would rebuild `StrftimeItems` and re-lex the format string on every record: over 2M
+rows that measured 140ms against 80ms, about 40% of the date column's cost. The pre-lexing
+happens once per batch, in `ColumnBuilder::new`.
 
 ## Non-goals
 

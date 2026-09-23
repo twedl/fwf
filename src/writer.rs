@@ -5,6 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::format::{Item, Parsed, StrftimeItems};
 use chrono::NaiveDate;
 use polars::prelude::*;
 use tempfile::NamedTempFile;
@@ -23,19 +24,15 @@ use crate::schema::{Field, Kind};
 /// exported item, so it cannot be imported; re-check it on a polars upgrade.
 pub const BATCH_ROWS: usize = 512 * 512;
 
-/// 1970-01-01 counted in chrono's days-since-1-CE numbering. Subtracting it is
-/// what turns a parsed date into the days-since-epoch a Parquet Date32 stores.
-/// The value is chrono's own `UNIX_EPOCH_DAY` (`datetime/mod.rs`), asserted
-/// against a real parse in this module's tests rather than taken on faith.
-const EPOCH_DAYS_FROM_CE: i32 = 719_163;
-
 enum ColumnBuilder {
     String(StringChunkedBuilder),
     Float64(PrimitiveChunkedBuilder<Float64Type>),
     Int64(PrimitiveChunkedBuilder<Int64Type>),
-    /// Holds its own format string: builders are rebuilt every batch, and a
-    /// clone per column per 262,144 rows costs nothing worth avoiding.
-    Date(PrimitiveChunkedBuilder<Int32Type>, String),
+    /// Holds the format already broken into items. `NaiveDate::parse_from_str`
+    /// would re-lex the format string on every row — it builds a fresh
+    /// `StrftimeItems` per call — and the format is identical for every row of
+    /// a column, so it is lexed once per batch here instead.
+    Date(PrimitiveChunkedBuilder<Int32Type>, Vec<Item<'static>>),
 }
 
 impl ColumnBuilder {
@@ -45,9 +42,13 @@ impl ColumnBuilder {
             Kind::String => ColumnBuilder::String(StringChunkedBuilder::new(name, capacity)),
             Kind::Float64 => ColumnBuilder::Float64(PrimitiveChunkedBuilder::new(name, capacity)),
             Kind::Int64 => ColumnBuilder::Int64(PrimitiveChunkedBuilder::new(name, capacity)),
-            Kind::Date(format) => {
-                ColumnBuilder::Date(PrimitiveChunkedBuilder::new(name, capacity), format.clone())
-            }
+            // A format that does not lex leaves no items, which parses nothing
+            // and so nulls every row — the same outcome a per-row parse against
+            // an unusable format already produced.
+            Kind::Date(format) => ColumnBuilder::Date(
+                PrimitiveChunkedBuilder::new(name, capacity),
+                StrftimeItems::new(format).parse_to_owned().unwrap_or_default(),
+            ),
         }
     }
 
@@ -72,8 +73,13 @@ impl ColumnBuilder {
                 Ok(number) => builder.append_value(number),
                 Err(_) => builder.append_null(),
             },
-            ColumnBuilder::Date(builder, format) => {
-                match NaiveDate::parse_from_str(value, format) {
+            ColumnBuilder::Date(builder, items) => {
+                // What `NaiveDate::parse_from_str` does, minus re-lexing the
+                // format: drive the pre-lexed items over this row's text.
+                let mut parsed = Parsed::new();
+                let date = chrono::format::parse(&mut parsed, value, items.iter())
+                    .and_then(|()| parsed.to_naive_date());
+                match date {
                     Ok(date) => builder.append_value(days_since_epoch(date)),
                     Err(_) => builder.append_null(),
                 }
@@ -108,8 +114,8 @@ impl ColumnBuilder {
 /// chrono's date range tops out near ±262,000 years — under 100 million days —
 /// so every date it can parse fits in the i32 a Date32 stores.
 fn days_since_epoch(date: NaiveDate) -> i32 {
-    use chrono::Datelike;
-    date.num_days_from_ce() - EPOCH_DAYS_FROM_CE
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
+    (date - epoch).num_days() as i32
 }
 
 pub struct Writer {
@@ -244,8 +250,9 @@ impl Writer {
 mod tests {
     use super::*;
 
-    /// `EPOCH_DAYS_FROM_CE` is the one number here transcribed from another
-    /// crate's source, so it is checked against dates chrono actually parses.
+    /// Pins the sign and the origin of the stored value: a Date32 counts days
+    /// from 1970-01-01 and goes negative before it, which is easy to get subtly
+    /// wrong and impossible to see in a Parquet file afterwards.
     #[test]
     fn dates_convert_to_days_since_the_epoch() {
         let day = |text| NaiveDate::parse_from_str(text, "%Y%m%d").unwrap();
