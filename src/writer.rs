@@ -51,9 +51,9 @@ impl From<&str> for Destination {
 ///
 /// A file is written to a temp file beside it, which replaces it only once
 /// everything is written: after an error, the file is as it was. On stdout, a
-/// reader that stops reading (as `head` does) ends the write without an
-/// error. A parsing error from [`scan`](crate::scan) is returned as the
-/// [`Error`] it holds.
+/// reader that stops reading (as `head` does) ends the write with an
+/// [`Error::Write`] whose source is of kind `BrokenPipe`. A parsing error from
+/// [`scan`](crate::scan) is returned as the [`Error`] it holds.
 pub fn write(
     batches: impl RecordBatchReader,
     format: Format,
@@ -61,7 +61,7 @@ pub fn write(
 ) -> Result<()> {
     match destination.into() {
         Destination::Path(path) => to_file(batches, format, &path),
-        Destination::Stdout => to_stdout(batches, format, io::stdout()),
+        Destination::Stdout => write_to(batches, format, io::stdout(), "-"),
     }
 }
 
@@ -77,17 +77,6 @@ fn to_file(batches: impl RecordBatchReader, format: Format, path: &Path) -> Resu
     file.persist(path)
         .map_err(|e| write_error(&name)(e.error))?;
     Ok(())
-}
-
-fn to_stdout(
-    batches: impl RecordBatchReader,
-    format: Format,
-    stdout: impl Write + Send,
-) -> Result<()> {
-    match write_to(batches, format, stdout, "-") {
-        Err(Error::Write { source, .. }) if source.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        result => result,
-    }
 }
 
 /// Writes the batches to `out` as `format`, then flushes it. `name` is the
@@ -219,30 +208,23 @@ mod tests {
     }
 
     #[test]
-    fn stdout_stops_quietly_when_its_reader_does() {
-        for format in [Format::Csv, Format::Parquet] {
-            for room in [0, 100] {
-                let kind = io::ErrorKind::BrokenPipe;
-                let result = to_stdout(people(), format, Full { room, kind });
-                assert!(result.is_ok(), "{format:?}, room {room}: {result:?}");
-            }
-        }
-    }
-
-    #[test]
     fn a_failed_write_keeps_its_io_error() {
-        for format in [Format::Csv, Format::Parquet] {
-            let kind = io::ErrorKind::StorageFull;
-            let err = to_stdout(people(), format, Full { room: 100, kind }).unwrap_err();
-            let Error::Write {
-                destination,
-                source,
-            } = &err
-            else {
-                panic!("{format:?}: {err:?}")
-            };
-            assert_eq!(destination, "-");
-            assert_eq!(source.kind(), kind, "{format:?}: {err}");
+        // A closed pipe must keep its kind, so a command-line tool can exit quietly.
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::StorageFull] {
+            for format in [Format::Csv, Format::Parquet] {
+                for room in [0, 100] {
+                    let err = write_to(people(), format, Full { room, kind }, "-").unwrap_err();
+                    let Error::Write {
+                        destination,
+                        source,
+                    } = &err
+                    else {
+                        panic!("{format:?}, room {room}: {err:?}")
+                    };
+                    assert_eq!(destination, "-");
+                    assert_eq!(source.kind(), kind, "{format:?}, room {room}: {err}");
+                }
+            }
         }
     }
 }
