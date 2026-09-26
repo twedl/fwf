@@ -15,6 +15,19 @@ use crate::{Field, Position, ReadOptions, Result, builder, framing, input};
 /// stay few.
 const CHUNKS_PER_THREAD: usize = 4;
 
+/// A block of a streamed unit's whole lines, read ahead to be parsed in
+/// parallel with others.
+struct Block {
+    bytes: Vec<u8>,
+    /// Where the block starts in its unit.
+    offset: usize,
+    /// The lines to parse: `take` of them, after the first `skip`.
+    skip: usize,
+    take: usize,
+    /// The unit's lines before the first one parsed, skipped ones included.
+    records_before: usize,
+}
+
 /// Parses a unit into record batches, one per chunk, as they're asked for.
 /// Each chunk is filled a column at a time.
 pub(crate) struct Parser {
@@ -104,26 +117,29 @@ impl Parser {
         })
     }
 
-    /// Parses a streamed unit a block at a time: each block is cut after its
-    /// last line ending, and the rest is carried into the next.
+    /// Parses a streamed unit a few blocks per thread at a time: the blocks are
+    /// read one after another, each cut after its last line ending with the
+    /// rest carried into the next, then parsed in parallel.
     fn parse_stream(
         self,
         unit: String,
         mut reader: Box<dyn Read + Send>,
     ) -> impl Iterator<Item = Result<RecordBatch>> {
         let size = self.options.chunk_size;
+        let skip_rows = self.options.skip_rows;
         let mut buf = Vec::new();
         let mut offset = 0;
         // The unit's lines so far, skipped ones included.
         let mut records = 0;
         let mut rows_left = self.options.n_rows.unwrap_or(usize::MAX);
         let mut at_end = false;
-        std::iter::from_fn(move || {
+        let name = unit.clone();
+        let mut read_block = move || {
             while !at_end && rows_left > 0 {
                 let read = (&mut reader).take(size as u64).read_to_end(&mut buf);
                 let read = match read {
                     Ok(read) => read,
-                    Err(e) => return Some(Err(input::io_error(&unit)(e))),
+                    Err(e) => return Some(Err(input::io_error(&name)(e))),
                 };
                 at_end = read < size;
                 let end = match framing::last_line_end(&buf) {
@@ -132,24 +148,65 @@ impl Parser {
                     // A line longer than a block: read more of it.
                     None => continue,
                 };
+                let mut rest = Vec::with_capacity(buf.len() - end + size);
+                rest.extend_from_slice(&buf[end..]);
+                buf.truncate(end);
+                let mut bytes = std::mem::replace(&mut buf, rest);
                 // Every block after the first follows the line ending it was cut at.
-                let block = framing::strip_eof_marker(&buf[..end], offset > 0);
-                let mut lines: Vec<_> = framing::lines(block).collect();
-                let skip = (self.options.skip_rows.saturating_sub(records)).min(lines.len());
-                lines.drain(..skip);
-                lines.truncate(rows_left);
-                let records_before = records + skip;
-                records = records_before + lines.len();
-                rows_left -= lines.len();
-                let batch = (!lines.is_empty())
-                    .then(|| self.parse_chunk(&unit, &lines, offset, || records_before));
+                bytes.truncate(framing::strip_eof_marker(&bytes, offset > 0).len());
+                let lines = framing::lines(&bytes).count();
+                let skip = skip_rows.saturating_sub(records).min(lines);
+                let take = (lines - skip).min(rows_left);
+                let block = Block {
+                    bytes,
+                    offset,
+                    skip,
+                    take,
+                    records_before: records + skip,
+                };
+                records += skip + take;
+                rows_left -= take;
                 offset += end;
-                buf.drain(..end);
-                if batch.is_some() {
-                    return batch;
+                if take > 0 {
+                    return Some(Ok(block));
                 }
             }
             None
+        };
+        let wave = self.install(rayon::current_num_threads) * CHUNKS_PER_THREAD;
+        std::iter::from_fn(move || {
+            let mut blocks = Vec::new();
+            let mut failed = None;
+            while blocks.len() < wave && failed.is_none() {
+                match read_block() {
+                    Some(Ok(block)) => blocks.push(block),
+                    Some(Err(e)) => failed = Some(e),
+                    None => break,
+                }
+            }
+            if blocks.is_empty() && failed.is_none() {
+                return None;
+            }
+            // A read error comes after the blocks read before it.
+            let mut batches = self.parse_blocks(&unit, &blocks);
+            batches.extend(failed.map(Err));
+            Some(batches)
+        })
+        .flatten()
+    }
+
+    /// Parses a streamed unit's blocks in parallel, keeping their order.
+    fn parse_blocks(&self, unit: &str, blocks: &[Block]) -> Vec<Result<RecordBatch>> {
+        self.install(|| {
+            (blocks.par_iter())
+                // Each worker reuses one line index from block to block.
+                .map_init(Vec::new, |lines, block| {
+                    lines.clear();
+                    let chosen = framing::lines(&block.bytes).skip(block.skip);
+                    lines.extend(chosen.take(block.take));
+                    self.parse_chunk(unit, lines, block.offset, || block.records_before)
+                })
+                .collect()
         })
     }
 
@@ -361,5 +418,26 @@ mod tests {
             assert!(results[..1000].iter().all(Result::is_ok), "stream {stream}");
             assert!(results[1000].is_err(), "stream {stream}");
         }
+    }
+
+    #[test]
+    fn a_read_error_comes_after_the_blocks_before_it() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken"))
+            }
+        }
+        // One 62-byte line per block, then the error.
+        let reader = Cursor::new(PEOPLE).chain(Broken);
+        let unit = Unit {
+            name: "test.txt".to_owned(),
+            input: Input::Stream(Box::new(reader)),
+        };
+        let options = options(SCHEMA).with_chunk_size(62);
+        let results: Vec<_> = Parser::new(&options).batches(unit).collect();
+        assert_eq!(results.len(), 9);
+        assert!(results[..8].iter().all(Result::is_ok));
+        assert!(matches!(results[8], Err(crate::Error::Io { .. })));
     }
 }

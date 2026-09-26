@@ -1,17 +1,25 @@
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use arrow_array::{RecordBatch, RecordBatchReader, RecordBatchWriter};
-use arrow_schema::ArrowError;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_csv::WriterBuilder;
+use arrow_schema::{ArrowError, Schema};
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_writer::{ArrowColumnWriter, ArrowRowGroupWriterFactory, compute_leaves};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use rayon::prelude::*;
 
 use crate::{Error, Result};
 
 /// Output is written in blocks this large: CSV reached a file about 3% faster
 /// than through the format writers' own 8 KiB buffers.
 const BUFFER: usize = 1 << 20;
+
+/// How many batches each thread writes at a time, as the parser parses a few
+/// chunks per thread at a time.
+const BATCHES_PER_THREAD: usize = 4;
 
 /// The format to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +63,12 @@ impl From<&str> for Destination {
 /// reader that stops reading (as `head` does) ends the write with an
 /// [`Error::Write`] whose source is of kind `BrokenPipe`. A parsing error from
 /// [`scan`](crate::scan) is returned as the [`Error`] it holds.
+///
+/// The batches are written a few per thread at a time on rayon's current
+/// thread pool (choose one with `ThreadPool::install`), while the next few are
+/// read. The output is the same as writing them one after another.
 pub fn write(
-    batches: impl RecordBatchReader,
+    batches: impl RecordBatchReader + Send,
     format: Format,
     destination: impl Into<Destination>,
 ) -> Result<()> {
@@ -66,7 +78,7 @@ pub fn write(
     }
 }
 
-fn to_file(batches: impl RecordBatchReader, format: Format, path: &Path) -> Result<()> {
+fn to_file(batches: impl RecordBatchReader + Send, format: Format, path: &Path) -> Result<()> {
     let name = path.display().to_string();
     let mut temp = tempfile::Builder::new();
     // The permissions of any new file, rather than a temp file's owner-only.
@@ -83,33 +95,24 @@ fn to_file(batches: impl RecordBatchReader, format: Format, path: &Path) -> Resu
 /// Writes the batches to `out` as `format`, then flushes it. `name` is the
 /// destination's name in errors.
 fn write_to(
-    batches: impl RecordBatchReader,
+    batches: impl RecordBatchReader + Send,
     format: Format,
     out: impl Write + Send,
     name: &str,
 ) -> Result<()> {
-    let schema = batches.schema();
     let mut out = Tracked {
         inner: BufWriter::with_capacity(BUFFER, out),
         error: None,
     };
     let written = match format {
-        Format::Csv => {
-            let mut writer = arrow_csv::Writer::new(&mut out);
-            // The header is written with the first batch; an empty one makes
-            // sure there is one when there are no records.
-            let header = writer.write(&RecordBatch::new_empty(schema));
-            header.and_then(|()| copy(batches, writer))
-        }
+        Format::Csv => write_csv(batches, &mut out),
         Format::Parquet => {
             // zstd's own default level.
             let level = ZstdLevel::try_new(3).expect("3 is a zstd level");
             let properties = WriterProperties::builder()
                 .set_compression(Compression::ZSTD(level))
                 .build();
-            ArrowWriter::try_new(&mut out, schema, Some(properties))
-                .map_err(ArrowError::from)
-                .and_then(|writer| copy(batches, writer))
+            write_parquet(batches, &mut out, properties)
         }
     };
     match written.and_then(|()| Ok(out.flush()?)) {
@@ -124,14 +127,148 @@ fn write_to(
     }
 }
 
-fn copy(
-    batches: impl RecordBatchReader,
-    mut writer: impl RecordBatchWriter,
+/// Writes a header row, then the batches, formatting each on its own thread.
+fn write_csv(
+    batches: impl RecordBatchReader + Send,
+    out: &mut (impl Write + Send),
 ) -> std::result::Result<(), ArrowError> {
-    for batch in batches {
-        writer.write(&batch?)?;
+    // The header is written with the first batch; an empty one makes sure
+    // there is one when there are no records.
+    let mut header = arrow_csv::Writer::new(Vec::new());
+    header.write(&RecordBatch::new_empty(batches.schema()))?;
+    out.write_all(&header.into_inner())?;
+    in_waves(batches, |wave| {
+        let texts = wave.par_iter().map(|batch| {
+            let mut writer = WriterBuilder::new().with_header(false).build(Vec::new());
+            writer.write(batch)?;
+            Ok(writer.into_inner())
+        });
+        for text in texts.collect::<std::result::Result<Vec<_>, ArrowError>>()? {
+            out.write_all(&text)?;
+        }
+        Ok(())
+    })
+}
+
+/// Writes the same file as `ArrowWriter`, encoding each field's columns on
+/// their own thread.
+fn write_parquet(
+    batches: impl RecordBatchReader + Send,
+    out: impl Write + Send,
+    properties: WriterProperties,
+) -> std::result::Result<(), ArrowError> {
+    let schema = batches.schema();
+    let limit = properties.max_row_group_row_count().unwrap_or(usize::MAX);
+    let writer = ArrowWriter::try_new(out, schema.clone(), Some(properties))?;
+    let (mut file, factory) = writer.into_serialized_writer()?;
+    let mut fields = column_writers(&factory, &file)?;
+    let mut rows = 0;
+    in_waves(batches, |wave| {
+        // The wave's rows for the current row group. A batch that fills it is
+        // split, and the rest goes to the next.
+        let mut pieces = Vec::new();
+        for batch in wave {
+            let mut batch = batch.clone();
+            while batch.num_rows() > 0 {
+                let take = batch.num_rows().min(limit - rows);
+                pieces.push(batch.slice(0, take));
+                batch = batch.slice(take, batch.num_rows() - take);
+                rows += take;
+                if rows == limit {
+                    encode(&mut fields, &schema, &pieces)?;
+                    pieces.clear();
+                    close_row_group(&mut file, std::mem::take(&mut fields))?;
+                    fields = column_writers(&factory, &file)?;
+                    rows = 0;
+                }
+            }
+        }
+        Ok(encode(&mut fields, &schema, &pieces)?)
+    })?;
+    if rows > 0 {
+        close_row_group(&mut file, fields)?;
     }
-    writer.close()
+    file.close()?;
+    Ok(())
+}
+
+/// The next row group's column writers, one per leaf column, grouped by the
+/// field they belong to.
+fn column_writers<W: Write + Send>(
+    factory: &ArrowRowGroupWriterFactory,
+    file: &SerializedFileWriter<W>,
+) -> parquet::errors::Result<Vec<Vec<ArrowColumnWriter>>> {
+    let leaves = file.schema_descr();
+    let mut fields: Vec<Vec<_>> = leaves
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|_| Vec::new())
+        .collect();
+    let writers = factory.create_column_writers(file.flushed_row_groups().len())?;
+    for (leaf, writer) in writers.into_iter().enumerate() {
+        fields[leaves.get_column_root_idx(leaf)].push(writer);
+    }
+    Ok(fields)
+}
+
+/// Encodes batches into a row group's writers, each field on its own thread.
+fn encode(
+    fields: &mut [Vec<ArrowColumnWriter>],
+    schema: &Schema,
+    batches: &[RecordBatch],
+) -> parquet::errors::Result<()> {
+    fields
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(i, writers)| {
+            for batch in batches {
+                let leaves = compute_leaves(schema.field(i), batch.column(i))?;
+                for (writer, leaf) in writers.iter_mut().zip(&leaves) {
+                    writer.write(leaf)?;
+                }
+            }
+            Ok(())
+        })
+}
+
+/// Finishes a row group's columns in parallel, then appends them to the file.
+fn close_row_group<W: Write + Send>(
+    file: &mut SerializedFileWriter<W>,
+    fields: Vec<Vec<ArrowColumnWriter>>,
+) -> parquet::errors::Result<()> {
+    let chunks = fields
+        .into_par_iter()
+        .flatten()
+        .map(ArrowColumnWriter::close);
+    let chunks = chunks.collect::<parquet::errors::Result<Vec<_>>>()?;
+    let mut row_group = file.next_row_group()?;
+    for chunk in chunks {
+        chunk.append_to_row_group(&mut row_group)?;
+    }
+    row_group.close()?;
+    Ok(())
+}
+
+/// Hands `write` the batches a few per thread at a time, to write in parallel,
+/// and reads the next few while it writes. A parsing error ends the write once
+/// the batches before it are written, but the ones read with it are dropped.
+fn in_waves(
+    mut batches: impl RecordBatchReader + Send,
+    mut write: impl FnMut(&[RecordBatch]) -> std::result::Result<(), ArrowError> + Send,
+) -> std::result::Result<(), ArrowError> {
+    let size = rayon::current_num_threads() * BATCHES_PER_THREAD;
+    let mut read = || {
+        let wave = batches.by_ref().take(size);
+        wave.collect::<std::result::Result<Vec<_>, _>>()
+    };
+    let mut wave = read()?;
+    while !wave.is_empty() {
+        let (written, next) = rayon::join(|| write(&wave), &mut read);
+        written?;
+        wave = next?;
+    }
+    Ok(())
 }
 
 fn write_error(destination: &str) -> impl FnOnce(io::Error) -> Error + '_ {
@@ -227,5 +364,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parquet_is_the_file_arrow_writer_writes() {
+        // On one thread, 4 batches of about 4 records are written at a time, so
+        // 80 records make several waves, and row groups of 7 split batches.
+        let bytes = Bytes::from(PEOPLE.repeat(10));
+        let options = ReadOptions::new(Schema::from_json(SCHEMA).unwrap(), Encoding::Cp1252);
+        let options = options.with_chunk_size(200);
+        let scan = || crate::scan(Location::Bytes(bytes.clone()), &options).unwrap();
+        let properties = || {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(7))
+                .build()
+        };
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build();
+        let mut ours = Vec::new();
+        let written = pool
+            .unwrap()
+            .install(|| write_parquet(scan(), &mut ours, properties()));
+        written.unwrap();
+
+        let mut theirs = Vec::new();
+        let writer = ArrowWriter::try_new(&mut theirs, scan().schema(), Some(properties()));
+        let mut writer = writer.unwrap();
+        for batch in scan() {
+            writer.write(&batch.unwrap()).unwrap();
+        }
+        writer.close().unwrap();
+        assert_eq!(ours, theirs);
     }
 }

@@ -37,7 +37,7 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Scan | Agreed | `scan()` returns `Box<dyn RecordBatchReader + Send>`. Opening errors come from `scan()`; parsing errors come from the reader as `ArrowError::ExternalError` holding an `fwf::Error`, and nothing is read after one. `read()` collects the same batches. | Arrow's reader trait is what arrow-csv, parquet and the Arrow C Stream interface take. |
 | Lazy parsing | Agreed | An in-memory unit is parsed 4 chunks per thread at a time, when the batches are asked for. | Bounds `scan()`'s memory (about 32 MiB of input on 8 threads) for about 5% on `read()`; see Parsing order. |
 | Parallel errors | Agreed | If several chunks fail, the error reported is the first in the unit. | Errors stay the same from run to run, whichever thread finds one first. |
-| Output API | Agreed | `write(batches, format, destination)` takes any Arrow `RecordBatchReader`, with `Format { Csv, Parquet }` and `Destination { Path, Stdout }`. | Every destination consumes the batches `scan()` yields. Custom destinations use those directly, so there is no `Sink` trait. |
+| Output API | Agreed | `write(batches, format, destination)` takes any Arrow `RecordBatchReader + Send`, with `Format { Csv, Parquet }` and `Destination { Path, Stdout }`. | Every destination consumes the batches `scan()` yields. Custom destinations use those directly, so there is no `Sink` trait. |
 | Parquet compression | Decided | zstd at level 3, zstd's own default. | Chosen on 2026-09-26. Polars also defaults to zstd, while the parquet crate's default is uncompressed. |
 | Terminal check | Decided | The CLI (step 8) refuses to write Parquet to a terminal unless given `--force`. The library writes wherever it's told. | Chosen on 2026-09-26. The rule protects a person at a shell. |
 | Cargo features | Decided | `arrow-csv` and `parquet` are always compiled, with no cargo features. | Chosen on 2026-09-26. A feature can come later if a library user wants only reading. |
@@ -49,6 +49,9 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Progress | Decided | None for now: stdout carries only data and stderr only errors. | Chosen on 2026-09-26. |
 | CLI rows | Decided | `--skip-rows` and `--n-rows`, as in `ReadOptions`. Column selection isn't exposed. | Chosen on 2026-09-26. |
 | CLI feature | Decided | The binary needs the `cli` feature, which is on by default. Library users who don't want `clap` set `default-features = false`. | Chosen on 2026-09-26, so `cargo install fwf` and `cargo test` include the command. `Encoding`, `Container` and `Format` derive `clap::ValueEnum` only under the feature. |
+| Parallel writing | Agreed | `write()` takes 4 batches per thread at a time. CSV formats each batch on its own thread and writes the texts in order. Parquet encodes each field's columns on its own thread with the parquet crate's `ArrowColumnWriter`, splitting row groups where `ArrowWriter` does, so the file is byte for byte the one `ArrowWriter` writes. | Profiling in step 9 found 90–93% of a conversion in the one writer thread. See Output surface. |
+| Reading ahead | Decided | `write()` reads the next batches while it writes the current ones, so it takes a reader that is `Send`. | Chosen on 2026-09-26. Worth 10–14% on gzip input and 1–5% on plain files, for about 60 MB more peak memory. |
+| Parallel streams | Decided | A streamed unit is read 4 blocks per thread at a time, one after another, and those blocks are parsed in parallel. | Chosen on 2026-09-26. Took gzip → CSV from 2.65 s to 1.75 s. |
 
 ## Core architecture
 
@@ -59,7 +62,7 @@ In FWF the layout gives field boundaries before any byte is read; only record bo
   - Framing: a record ends at `\n`, and a `\r` before it is dropped. Chunks are cut after a `\n`.
   - `field::value(line, start, len)` returns a field's trimmed bytes and where they start; an empty value is null, and a short line leaves later fields empty.
   - Byte-level parsers for declared types, one specialized loop per column. v1 has only `Float64`; integers, dates and decimals can come later.
-- **Columnar reader** (polars shape): split each in-memory unit into chunks of about 1 MiB and parse them in parallel (rayon), a few per thread at a time; read streamed units a block of the same size at a time. Each chunk becomes one Arrow `RecordBatch`; `scan()` yields them as they're parsed, and `read()` joins them in order. Within a chunk, one pass indexes the lines, then each column is filled in its own loop: its type is chosen once and its builder stays in cache. Polars goes a record at a time instead.
+- **Columnar reader** (polars shape): split each in-memory unit into chunks of about 1 MiB and parse them in parallel (rayon), a few per thread at a time; read streamed units in blocks of the same size, a few per thread at a time, and parse those in parallel too. Each chunk becomes one Arrow `RecordBatch`; `scan()` yields them as they're parsed, and `read()` joins them in order. Within a chunk, one pass indexes the lines, then each column is filled in its own loop: its type is chosen once and its builder stays in cache. Polars goes a record at a time instead.
 
 There is no csv-crate-style row reader. Ship one crate with cargo features; split out a core crate only if something needs it on its own.
 
@@ -105,12 +108,14 @@ src/
   field.rs        one field's trimmed value on a line, and where it starts
   builder.rs      column builders → Arrow arrays (String → Utf8, Float64 → Float64, all nullable)
   read_impl.rs    Parser: in-memory units split into chunks parsed in parallel, a few per thread
-                  at a time; streams read a block at a time; each chunk filled a column at a
-                  time into one RecordBatch, when it's asked for
+                  at a time; streams read the same number of blocks at a time, then parsed in
+                  parallel; each chunk filled a column at a time into one RecordBatch, when
+                  it's asked for
   reader.rs       read(location) → one RecordBatch (concat_batches); scan(location) →
                   RecordBatchReader
-  writer.rs       write(batches, format, destination): CSV (arrow-csv) or Parquet (ArrowWriter,
-                  zstd) to a file (temp file + rename) or stdout
+  writer.rs       write(batches, format, destination): CSV (arrow-csv) or Parquet (ArrowWriter's
+                  column writers, zstd), a few batches per thread at a time, to a file (temp
+                  file + rename) or stdout
   main.rs         the `fwf` command (clap), built with the `cli` feature
 tests/
   fixtures/…
@@ -134,7 +139,7 @@ scripts/
 | `CsvEncoding { Utf8, LossyUtf8 }` | `encoding.rs` | The opposite set: cp1252 and cp850, no UTF-8. |
 | polars-stream `io_sources/csv/` | stream path in `read_impl.rs` | Same split between reading line batches and parsing them, without a query engine. |
 
-**Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an Arrow `RecordBatchReader`, with column selection and `n_rows` as plain options, and `read()` collects the same batches. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel, a few per thread at a time as the reader asks; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
+**Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an Arrow `RecordBatchReader`, with column selection and `n_rows` as plain options, and `read()` collects the same batches. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel, a few per thread at a time as the reader asks; streamed units are read a few blocks per thread at a time, each cut at its last newline with the rest carried into the next, and those blocks are parsed in parallel.
 
 **Dependencies:** `arrow-array`, `arrow-schema`, `arrow-select` and `arrow-csv` (not the full `arrow` crate), `parquet` with only its `arrow` and `zstd` features, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`. `clap` with the default `cli` feature.
 
@@ -152,7 +157,7 @@ scripts/
     - Done. Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip (see Test fixtures). They passed without changes to the reader.
     - Python / polars: export batches through the Arrow C Stream interface, or a polars IO plugin (`register_io_source`) for `scan_fwf`.
     - More types (`Int64`, `Date`, `Decimal`), `--no-mmap`, and several record types per file (still an open question).
-    - Performance, if profiling points there: writing CSV and Parquet on several threads (writing takes 90–95% of a conversion; see Output surface), parsing while the writer writes, parsing a stream's blocks in parallel while the next is decompressed, the stored-member CRC pass at open (it delays the first chunk), and a faster `Float64` parser.
+    - Partly done. Performance: writing CSV and Parquet on several threads, reading the next batches while they're written, and parsing a stream's blocks in parallel (see Output surface). Left, if profiling points there: the stored-member CRC pass at open (it delays the first chunk), a faster `Float64` parser, and flate2's `zlib-rs` backend, which decompressed the 153 MB gzip benchmark file in 0.77 s instead of the default miniz_oxide's 1.20 s.
 
 ## Input surface
 
@@ -175,7 +180,7 @@ pub fn scan(location: impl Into<Location>, options: &ReadOptions) -> Result<Box<
 ```
 
 - `Unit` and `Input` are crate-private; `scan()` didn't need them. A zip member is a slice of the mapped archive, so there are no file handles to hold open.
-- `read` parses the unit into one `RecordBatch`; `scan` yields its batches one chunk at a time. A `Stream` unit is read a block at a time.
+- `read` parses the unit into one `RecordBatch`; `scan` yields its batches one chunk at a time. A `Stream` unit is read 4 blocks per thread at a time, and those are parsed in parallel.
 - Units own their data and are `Send + 'static`, so they can move to worker threads later without an API change.
 - In-memory inputs are named `<bytes>` and `<reader>`; stdin is `-`.
 
@@ -247,27 +252,38 @@ One input for now, like the library. The command reads with `scan()` and writes 
 
 ## Output surface
 
-`write()` takes any Arrow `RecordBatchReader`, usually the one `scan()` returns, and writes its batches as CSV or Parquet to a file or stdout.
+`write()` takes any Arrow `RecordBatchReader` that is `Send`, usually the one `scan()` returns, and writes its batches as CSV or Parquet to a file or stdout. It writes 4 batches per thread at a time on rayon's current thread pool (a caller chooses one with `ThreadPool::install`), and reads the next ones while it does.
 
 ```rust
 pub enum Format      { Csv, Parquet }
 pub enum Destination { Path(PathBuf), Stdout }   // From<&str>, &Path, PathBuf
 
-pub fn write(batches: impl RecordBatchReader, format: Format, destination: impl Into<Destination>) -> Result<()>;
+pub fn write(batches: impl RecordBatchReader + Send, format: Format, destination: impl Into<Destination>) -> Result<()>;
 
 // fwf::write(fwf::scan("data.zip", &options)?, Format::Parquet, "data.parquet")?;
 ```
 
 - **Contract:** every destination consumes the same ordered batches. Custom destinations use `scan()`'s reader directly, so there is no `Sink` trait.
-- **CSV:** `arrow_csv::Writer` with its defaults: commas, a header row, `\n` line endings and no quotes unless a value needs them. A null is an empty field, and a `Float64` is written as Arrow prints it (`1234.5`, `7.0`). An input with no records still gets the header. A direct writer that skips Arrow was measured and turned down; see the decision log.
-- **Parquet:** `parquet::arrow::ArrowWriter` with zstd at level 3 and the crate's other defaults (row groups of up to 1,048,576 rows, dictionary encoding, page statistics). The Arrow schema is embedded, so readers get `Utf8` and `Float64` columns back. The footer comes last, so Parquet works on stdout.
+- **CSV:** `arrow_csv::Writer` with its defaults: commas, a header row, `\n` line endings and no quotes unless a value needs them. A null is an empty field, and a `Float64` is written as Arrow prints it (`1234.5`, `7.0`). An input with no records still gets the header. Each batch is formatted on its own thread, and the texts are written in order. A direct writer that skips Arrow was measured and turned down; see the decision log.
+- **Parquet:** the file `parquet::arrow::ArrowWriter` writes, with zstd at level 3 and the crate's other defaults (row groups of up to 1,048,576 rows, dictionary encoding, page statistics). Each field's columns are encoded on their own thread with the crate's `ArrowColumnWriter`, and row groups are split where `ArrowWriter` splits them, so the bytes are the same; a unit test compares them. The Arrow schema is embedded, so readers get `Utf8` and `Float64` columns back. The footer comes last, so Parquet works on stdout.
 - **Files:** written to a temp file in the destination's directory, which is renamed over the destination once everything is written and flushed. After an error, the destination is as it was and the temp file is removed. On Unix the file gets a new file's permissions (0666 less the umask), not a temp file's 0600. It isn't fsynced. A process killed mid-write, as by Ctrl-C, leaves its `.tmp…` file behind.
-- **Stdout:** it can't be replaced atomically, so the exit code is the signal. When the reader closes the pipe (`fwf … | head`), the write stops and nothing more is parsed. `write()` returns `Error::Write` with a `BrokenPipe` source, which the CLI treats as success. Both formats write through a 1 MiB buffer.
-- **Errors:** a parsing error from `scan()` comes back as the `fwf::Error` it was (for example `InvalidByte`), not wrapped. Anything else is `Error::Write { destination, source }`, where the destination is the path or `-`. The source is an `io::Error`: the one a write hit, or, when the batches can't be written in the format, the Arrow or Parquet error as kind `Other`. The format writers can turn an I/O error into text (arrow-csv keeps only the text when writing a record fails), so the writer is wrapped to keep the error itself. That keeps a closed pipe recognizable by its kind.
+- **Stdout:** it can't be replaced atomically, so the exit code is the signal. When the reader closes the pipe (`fwf … | head`), the write stops, and nothing is parsed past the batches already read ahead. `write()` returns `Error::Write` with a `BrokenPipe` source, which the CLI treats as success. Both formats write through a 1 MiB buffer.
+- **Errors:** a parsing error from `scan()` comes back as the `fwf::Error` it was (for example `InvalidByte`), not wrapped. Anything else is `Error::Write { destination, source }`, where the destination is the path or `-`. The source is an `io::Error`: the one a write hit, or, when the batches can't be written in the format, the Arrow or Parquet error as kind `Other`. The format writers can turn an I/O error into text (arrow-csv keeps only the text when writing a record fails), so the writer is wrapped to keep the error itself. That keeps a closed pipe recognizable by its kind. A parsing error ends the write after the batches before it are written, except those read along with the failing one (up to 4 per thread), which are dropped.
 - **Terminal:** the library writes Parquet wherever it's told. Refusing a terminal without `--force` is the CLI's job (step 8).
 - **In-memory use from Python or polars:** export through the Arrow C Stream interface (`__arrow_c_stream__`), in step 9.
 
 Measured after step 7 on the file from step 6 (40 fields, 301.5 MB, the same M1 with all 8 threads): draining `scan()` took 148 ms, writing CSV to a file 2.88–2.93 s (316 MB), and writing Parquet 1.42–1.44 s (38.5 MB). The writers run on one thread and take 90–95% of the time. Parsing doesn't overlap with them: the reader parses a few chunks per thread, then waits until the writer asks for more. The 1 MiB buffer took CSV from 2.99 s to 2.88–2.90 s and left Parquet unchanged, since both writers already buffer 8 KiB. Peak memory was 392 MB for CSV, 468 MB for Parquet and 384 MB for `scan()` alone, most of it the mapped file.
+
+Measured in step 9 with the `fwf` command on a new file of the same shape (40 fields, 24 String and 16 Float64, 200 characters, 1.5M records, 301.5 MB) and on the same file gzipped (153 MB), on the same M1 with all 8 threads, best of 5. Its values vary more than the step 6 file's, so its Parquet is 118 MB. Before step 9, the writer thread spent 90–93% of its time writing (formatting values for CSV; dictionaries, zstd and statistics for Parquet) and the rest waiting for the parser.
+
+| Conversion | Before step 9 | Parallel writers | + reading ahead | + parallel streams | Peak memory before → after |
+| --- | --- | --- | --- | --- | --- |
+| plain → CSV | 3.55 s | 1.00 s | 0.96 s | 0.96 s | 366 → 476 MB |
+| plain → Parquet | 2.68 s | 0.74 s | 0.73 s | 0.73 s | 536 → 622 MB |
+| gzip → CSV | 5.60 s | 3.09 s | 2.65 s | 1.75 s | 159 → 343 MB |
+| gzip → Parquet | 4.79 s | 2.87 s | 2.58 s | 1.65 s | 341 → 502 MB |
+
+Every output was byte for byte the one before step 9 wrote from the same input. `read()` on the gzip file went from 2,390 ms to 1,485 ms and stayed at 266–269 ms on the plain file. Decompressing the gzip file alone takes 1.20 s, so gzip input is now bound by decompression. On the plain file, the writer thread still waits about 20% of the time for parsing: parsing and writing now overlap, but they share the same cores.
 
 ## Test fixtures
 

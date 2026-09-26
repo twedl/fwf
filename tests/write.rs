@@ -45,6 +45,23 @@ fn csv_has_a_header_and_empty_nulls() {
 }
 
 #[test]
+fn csv_keeps_the_batches_in_order() {
+    // 800 batches of one record, written a few per thread at a time.
+    let text = fs::read(fixture("people.cp1252.txt")).unwrap();
+    let location = Location::Bytes(text.repeat(100).into());
+    let batches = fwf::scan(location, &people().with_chunk_size(1)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("people.csv");
+    fwf::write(batches, Format::Csv, &*out).unwrap();
+
+    let (header, records) = PEOPLE_CSV.split_at(PEOPLE_CSV.find('\n').unwrap() + 1);
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        header.to_owned() + &records.repeat(100)
+    );
+}
+
+#[test]
 fn parquet_reads_back_as_the_records() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("people.parquet");
