@@ -1,0 +1,8 @@
+{"fields": [
+  {"name": "id", "position": 1, "length": 6, "description": "Record id, zero-padded"},
+  {"name": "name", "position": 7, "length": 20, "type": "String", "description": "Full name"},
+  {"name": "city", "position": 27, "length": 15, "description": "City of residence; blank if unknown"},
+  {"name": "born", "position": 42, "length": 8, "description": "Date of birth, YYYYMMDD"},
+  {"name": "amount", "position": 50, "length": 10, "type": "Flaot64", "description": "Balance, right-aligned"},
+  {"name": "code", "position": 60, "length": 2, "description": "Country code; blank if unknown"}
+]}

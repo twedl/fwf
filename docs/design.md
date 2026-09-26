@@ -1,6 +1,6 @@
 # fwf rewrite: design decisions
 
-Exported on 2026-09-26 from the [design doc](https://claude.ai/code/artifact/87dd86a4-6d4d-4772-ba14-dc201d729b60).
+Exported on 2026-09-26 from the [design doc](https://claude.ai/code/artifact/87dd86a4-6d4d-4772-ba14-dc201d729b60), and updated here since.
 
 ## Context and scope
 
@@ -15,7 +15,11 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Decision | Status | What we chose | Why |
 | --- | --- | --- | --- |
 | Column types | Decided | No type guessing. A column with no declared type is a string. | Guessed types are silently wrong on FWF data (e.g. `01234` a ZIP code vs `0000123` a zero-filled amount). Also means input is read strictly forward, with no sample-and-replay. |
-| Layout | Decided | Every layout gives each column's position and length, with 1-based start positions. It can also be written as start–end ranges or as a list of widths. Types are optional. | That is what the schemas we receive contain, so no width inference is needed. |
+| Layout | Decided | Every layout gives each field's position (1-based) and length. Types are optional. Start–end ranges and width lists are dropped for now. | That is what the schemas we receive contain, so no width inference is needed. |
+| Schema file | Decided | JSON: `{"fields": [...]}`. Each field has `name`, `position` (1-based), `length` and an optional `type`; any other keys are ignored. | Chosen by the user. |
+| Type names | Decided | Polars names. Only `String` and `Float64` for now. No `type` means `String`; an unknown `type` is an error. | Polars names map one-to-one to Arrow types and are what downstream users know. The error catches typos like `Flaot64`. |
+| Width unit | Decided | Widths count characters, including in UTF-8. | Chosen by the user. In cp1252 and cp850 characters are bytes. |
+| Containers | Decided | Plain text, gzip, and zip with stored, deflate or deflate64 members. | Requested by the user; deflate64 was added on 2026-09-26. |
 | Encodings | Decided | `utf-8` (default, strict), `cp1252`, `cp850`. | These cover the files we expect. All three are ASCII-compatible, so framing, trimming and number parsing work on raw bytes. |
 | EBCDIC-037 | Dropped | Not supported. | Not needed. Dropping it removes the only encoding where space, digits and newline differ from ASCII. |
 | Latin-1 | Dropped | Not supported; use `cp1252`. | Identical except bytes 0x80–0x9F, where Latin-1 has control codes that almost never occur in real data. |
@@ -28,10 +32,10 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 In FWF the layout gives field boundaries before any byte is read; only record boundaries are found by scanning. So there is no tokenizer, skipped columns cost nothing, parallel splits are always correct, and each column can be parsed in its own tight loop.
 
 - **Core**, shared by everything:
-  - `Layout`: columns with 0-based, half-open byte spans, trim, pad byte and null rule, plus an optional type (default: string). The builder accepts 1-based inclusive start–end, start + width, or a list of widths. Gaps and overlaps are allowed.
-  - `Framing`: `Lines { terminator: Lf | CrLf | Auto }` or `Fixed { record_len }` for files with no line terminators.
+  - `Layout`: columns with 0-based, half-open spans counted in characters, trim, pad byte and null rule, plus an optional type (default: `String`). Each field is given as a 1-based position and a length. Gaps and overlaps are allowed.
+  - `Framing`: `Lines { terminator: Lf | CrLf | Auto }` or `Fixed { record_len }` for files with no line terminators. `Fixed` cuts by bytes, so it needs cp1252, cp850 or pure-ASCII UTF-8.
   - `extract(line, &Column)` returns `Null` or `Value(&[u8])`, and applies the policy for lines shorter than the layout.
-  - Byte-level parsers for declared types (integers, floats, implied decimals, fixed-position dates), one specialized loop per column.
+  - Byte-level parsers for declared types, one specialized loop per column. v1 has only `Float64`; integers, dates and decimals can come later.
 - **Row reader and writer** (csv-crate shape): `Reader<R: Read>`, reusable `ByteRecord` and `StringRecord`, serde `deserialize`, and a `Writer` driven by the same `Layout`.
 - **Columnar reader** (polars shape): split the input into chunks, find line starts, parse each requested column in its own loop per chunk (rayon), then join the chunks in order into Arrow `RecordBatch`es.
 
@@ -81,6 +85,7 @@ The `zip` crate is used only to read the archive's index. Each member's bytes ar
 
 - Stored (uncompressed) members become a `Slice` and get the fully parallel path.
 - Deflated members become a `DeflateDecoder` over the sub-slice, which is a `Stream`. We check each member's CRC-32 at its end, since we bypass the crate's own reader.
+- Deflate64 members work the same way, using the `deflate64` crate's decoder.
 - Directories are skipped. Encrypted members and other compression methods are rejected with an error naming the member.
 
 ### Rules applied per unit
@@ -101,12 +106,12 @@ The encoding only matters when a string field is converted to UTF-8.
 - CP1252 leaves five bytes undefined (`0x81`, `0x8D`, `0x8F`, `0x90`, `0x9D`), and they raise an error. CP850 defines all 256.
 - The tables are tested against a fixture generated from Python's codecs.
 - A wrong code page fails silently: bytes `4A 6F 73 E9` read as `José` in CP1252 but `JosÚ` in CP850.
-- With single-byte code pages, byte widths and character widths are the same; that question only arises for UTF-8.
+- Widths count characters. In cp1252 and cp850 that is the same as bytes. In UTF-8, a line with non-ASCII characters needs a character-to-byte offset map before slicing; pure-ASCII lines skip it.
 
 ### Command line
 
 ```
-fwf convert [INPUT ...] --layout spec.toml
+fwf convert [INPUT ...] --layout schema.json
   INPUT            file path, or '-' for stdin (default '-'); the shell expands globs
   --input-format   auto | plain | gzip | zip        (default auto)
   --entry GLOB     zip members to read, repeatable  (default: the only member)
@@ -127,13 +132,19 @@ Not started. These are notes from the discussion to pick up later.
 - **Stdout:** wrap in `BufWriter` (Rust's stdout flushes every line), exit quietly on `BrokenPipe`, and send everything except data to stderr.
 - **In-memory use from Python or polars:** export through the Arrow C Stream interface (`__arrow_c_stream__`).
 
+## Test fixtures
+
+`tests/fixtures/generate.py` writes one set of records in every encoding (utf-8, cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`). Stdin tests pipe or redirect the same files. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run.
+
 ## Open questions
 
 - [x] Are layout column positions always required, with no width inference? Yes: every layout gives positions and lengths; types are optional.
 - [ ] Strict UTF-8 errors, or replace invalid bytes with `U+FFFD` and report a count? Recommended: strict.
-- [ ] For UTF-8 input, do widths count bytes or characters? Recommended: bytes.
+- [x] For UTF-8 input, do widths count bytes or characters? Characters.
 - [ ] Can one file hold several record types (header, detail, trailer keyed by a code at a fixed position)? Cheap to leave room for now, expensive to add later.
-- [ ] What format is the `--layout` file? TOML is assumed but not designed.
+- [x] What format is the `--layout` file? JSON.
+- [x] What values can a field's `type` take, and is an unknown `type` an error? `String` or `Float64` (polars names); none means `String`; unknown is an error.
+- [x] Schema files give only position and length. Does the library API still take start–end ranges and widths lists? No, dropped for now.
 - [ ] A zip arriving on a pipe: copy to a temp file (current plan), try to stream it, or reject it?
 - [ ] Several inputs or zip members: one output, or one per unit? One output needs a source-name column.
 - [ ] Default format on stdout: CSV, or require `--format`? Recommended: CSV.
@@ -147,6 +158,6 @@ Each input item below fits into resolution steps 1–3 later without touching th
 - Parsing several units at once; it mostly helps zips with many deflated members.
 - `--no-mmap`. Mapping can crash (SIGBUS) if the file is truncated mid-read, and network filesystems are another reason to want it.
 - Loading a whole decompressed file into memory to get exact parallel splits.
-- Nested archives, zip methods other than stored and deflate, encrypted zips, and standalone zstd or bzip2 files.
+- Nested archives, zip methods other than stored, deflate and deflate64, encrypted zips, and standalone zstd or bzip2 files.
 - EBCDIC, Latin-1 and other code pages.
 - All output work (see Output surface).
