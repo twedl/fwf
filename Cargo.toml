@@ -13,7 +13,9 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"], optional = true }
 crc32fast = "1.5.2"
 deflate64 = "0.1.12"
-flate2 = "1.1.10"
+# zlib-rs decompresses about 1.9× faster than the default miniz_oxide.
+# runtime_detection lets it use AVX2 on x86-64 CPUs that have it.
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 memchr = "2.8.3"
 memmap2 = "0.9.11"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "zstd"] }

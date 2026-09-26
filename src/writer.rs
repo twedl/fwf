@@ -132,14 +132,15 @@ fn write_csv(
     batches: impl RecordBatchReader + Send,
     out: &mut (impl Write + Send),
 ) -> std::result::Result<(), ArrowError> {
+    let builder = WriterBuilder::new();
     // The header is written with the first batch; an empty one makes sure
     // there is one when there are no records.
-    let mut header = arrow_csv::Writer::new(Vec::new());
+    let mut header = builder.clone().build(Vec::new());
     header.write(&RecordBatch::new_empty(batches.schema()))?;
     out.write_all(&header.into_inner())?;
     in_waves(batches, |wave| {
         let texts = wave.par_iter().map(|batch| {
-            let mut writer = WriterBuilder::new().with_header(false).build(Vec::new());
+            let mut writer = builder.clone().with_header(false).build(Vec::new());
             writer.write(batch)?;
             Ok(writer.into_inner())
         });
@@ -158,6 +159,9 @@ fn write_parquet(
     properties: WriterProperties,
 ) -> std::result::Result<(), ArrowError> {
     let schema = batches.schema();
+    // Row groups are split as ArrowWriter splits them only by their row count.
+    debug_assert!(properties.max_row_group_bytes().is_none());
+    debug_assert!(properties.content_defined_chunking().is_none());
     let limit = properties.max_row_group_row_count().unwrap_or(usize::MAX);
     let writer = ArrowWriter::try_new(out, schema.clone(), Some(properties))?;
     let (mut file, factory) = writer.into_serialized_writer()?;
@@ -252,23 +256,32 @@ fn close_row_group<W: Write + Send>(
 
 /// Hands `write` the batches a few per thread at a time, to write in parallel,
 /// and reads the next few while it writes. A parsing error ends the write once
-/// the batches before it are written, but the ones read with it are dropped.
+/// the batches before it are written.
 fn in_waves(
     mut batches: impl RecordBatchReader + Send,
     mut write: impl FnMut(&[RecordBatch]) -> std::result::Result<(), ArrowError> + Send,
 ) -> std::result::Result<(), ArrowError> {
     let size = rayon::current_num_threads() * BATCHES_PER_THREAD;
+    // The next few batches, and the error that cut them short, if one did.
     let mut read = || {
-        let wave = batches.by_ref().take(size);
-        wave.collect::<std::result::Result<Vec<_>, _>>()
+        let mut wave = Vec::with_capacity(size);
+        for batch in batches.by_ref().take(size) {
+            match batch {
+                Ok(batch) => wave.push(batch),
+                Err(e) => return (wave, Err(e)),
+            }
+        }
+        (wave, Ok(()))
     };
-    let mut wave = read()?;
-    while !wave.is_empty() {
+    let (mut wave, mut status) = read();
+    while status.is_ok() && !wave.is_empty() {
         let (written, next) = rayon::join(|| write(&wave), &mut read);
         written?;
-        wave = next?;
+        (wave, status) = next;
     }
-    Ok(())
+    // The batches before an error, if one ended the reading.
+    write(&wave)?;
+    status
 }
 
 fn write_error(destination: &str) -> impl FnOnce(io::Error) -> Error + '_ {
@@ -364,6 +377,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_batches_before_a_parsing_error_are_written() {
+        // A ninth record, whose amount is "1234,50".
+        let bad: Vec<u8> = PEOPLE[..62]
+            .iter()
+            .map(|&b| if b == b'.' { b',' } else { b })
+            .collect();
+        let options = ReadOptions::new(Schema::from_json(SCHEMA).unwrap(), Encoding::Cp1252);
+        let location = Location::Bytes([PEOPLE, &bad].concat().into());
+        let batches = crate::scan(location, &options.with_chunk_size(1)).unwrap();
+        let mut out = Vec::new();
+        let err = write_to(batches, Format::Csv, &mut out, "-").unwrap_err();
+        assert!(matches!(err, Error::InvalidFloat { .. }), "{err:?}");
+
+        let mut expected = Vec::new();
+        write_to(people(), Format::Csv, &mut expected, "-").unwrap();
+        assert_eq!(out, expected);
     }
 
     #[test]

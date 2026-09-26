@@ -79,46 +79,33 @@ fn bytes_and_readers_read_like_files() {
     }
 }
 
-/// A fixture as bytes, which are parsed in chunks in parallel, and as a reader,
-/// which is streamed, each with a label for assertion messages.
-fn slice_and_stream(file: &str) -> [(String, Location); 2] {
+/// Reads a fixture from bytes, which are parsed in chunks in parallel, and from
+/// a reader, which is streamed, and checks both give the expected records.
+fn assert_reads_as(file: &str, options: &ReadOptions, expected: &Value) {
     let data = read_fixture(file);
-    [
-        (
-            format!("{file} from bytes"),
-            Location::Bytes(data.clone().into()),
-        ),
-        (
-            format!("{file} from a reader"),
-            Location::Reader(Box::new(Cursor::new(data))),
-        ),
-    ]
+    let from_bytes = fwf::read(Location::Bytes(data.clone().into()), options).unwrap();
+    assert_eq!(rows(&from_bytes), *expected, "{file} from bytes");
+    let from_reader = fwf::read(Location::Reader(Box::new(Cursor::new(data))), options).unwrap();
+    assert_eq!(rows(&from_reader), *expected, "{file} from a reader");
 }
 
 #[test]
 fn dos_line_endings_and_eof_marker_are_dropped() {
-    for (how, location) in slice_and_stream("people.cp1252.dos.txt") {
-        let batch = fwf::read(location, &people(Encoding::Cp1252)).unwrap();
-        assert_eq!(rows(&batch), expected(), "{how}");
-    }
+    let options = people(Encoding::Cp1252);
+    assert_reads_as("people.cp1252.dos.txt", &options, &expected());
 }
 
 #[test]
 fn every_gzip_member_is_read() {
     // Two members, split inside a record.
-    for (how, location) in slice_and_stream("people.cp1252.multi.txt.gz") {
-        let batch = fwf::read(location, &people(Encoding::Cp1252)).unwrap();
-        assert_eq!(rows(&batch), expected(), "{how}");
-    }
+    let options = people(Encoding::Cp1252);
+    assert_reads_as("people.cp1252.multi.txt.gz", &options, &expected());
 }
 
 #[test]
 fn skip_rows_skips_a_header() {
     let options = people(Encoding::Cp1252).with_skip_rows(1);
-    for (how, location) in slice_and_stream("people.cp1252.header.txt") {
-        let batch = fwf::read(location, &options).unwrap();
-        assert_eq!(rows(&batch), expected(), "{how}");
-    }
+    assert_reads_as("people.cp1252.header.txt", &options, &expected());
 
     let file = fixture("people.cp1252.header.txt");
     let err = fwf::read(&*file, &people(Encoding::Cp1252)).unwrap_err();
@@ -135,10 +122,8 @@ fn short_and_blank_lines_leave_fields_null() {
     // is a record of nulls; and a line cut off in the city field keeps "Düss".
     let expected: Value =
         serde_json::from_slice(&read_fixture("people.ragged.expected.json")).unwrap();
-    for (how, location) in slice_and_stream("people.cp1252.ragged.txt") {
-        let batch = fwf::read(location, &people(Encoding::Cp1252)).unwrap();
-        assert_eq!(rows(&batch), expected, "{how}");
-    }
+    let options = people(Encoding::Cp1252);
+    assert_reads_as("people.cp1252.ragged.txt", &options, &expected);
 }
 
 #[test]

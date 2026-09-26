@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{self, Read};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -133,13 +133,16 @@ impl Parser {
         let mut records = 0;
         let mut rows_left = self.options.n_rows.unwrap_or(usize::MAX);
         let mut at_end = false;
-        let name = unit.clone();
-        let mut read_block = move || {
+        let read_block = move || -> Option<io::Result<Block>> {
             while !at_end && rows_left > 0 {
                 let read = (&mut reader).take(size as u64).read_to_end(&mut buf);
                 let read = match read {
                     Ok(read) => read,
-                    Err(e) => return Some(Err(input::io_error(&name)(e))),
+                    Err(e) => {
+                        // Nothing is read after an error.
+                        at_end = true;
+                        return Some(Err(e));
+                    }
                 };
                 at_end = read < size;
                 let end = match framing::last_line_end(&buf) {
@@ -148,10 +151,9 @@ impl Parser {
                     // A line longer than a block: read more of it.
                     None => continue,
                 };
-                let mut rest = Vec::with_capacity(buf.len() - end + size);
-                rest.extend_from_slice(&buf[end..]);
-                buf.truncate(end);
+                let rest = buf.split_off(end);
                 let mut bytes = std::mem::replace(&mut buf, rest);
+                buf.reserve(size);
                 // Every block after the first follows the line ending it was cut at.
                 bytes.truncate(framing::strip_eof_marker(&bytes, offset > 0).len());
                 let lines = framing::lines(&bytes).count();
@@ -173,38 +175,25 @@ impl Parser {
             }
             None
         };
+        let mut blocks = std::iter::from_fn(read_block);
         let wave = self.install(rayon::current_num_threads) * CHUNKS_PER_THREAD;
         std::iter::from_fn(move || {
-            let mut blocks = Vec::new();
-            let mut failed = None;
-            while blocks.len() < wave && failed.is_none() {
-                match read_block() {
-                    Some(Ok(block)) => blocks.push(block),
-                    Some(Err(e)) => failed = Some(e),
-                    None => break,
-                }
-            }
-            if blocks.is_empty() && failed.is_none() {
-                return None;
-            }
-            // A read error comes after the blocks read before it.
-            let mut batches = self.parse_blocks(&unit, &blocks);
-            batches.extend(failed.map(Err));
-            Some(batches)
+            let blocks: Vec<_> = blocks.by_ref().take(wave).collect();
+            (!blocks.is_empty()).then(|| self.parse_blocks(&unit, blocks))
         })
         .flatten()
     }
 
-    /// Parses a streamed unit's blocks in parallel, keeping their order.
-    fn parse_blocks(&self, unit: &str, blocks: &[Block]) -> Vec<Result<RecordBatch>> {
+    /// Parses a streamed unit's blocks in parallel, keeping their order: a read
+    /// error comes after the blocks read before it.
+    fn parse_blocks(&self, unit: &str, blocks: Vec<io::Result<Block>>) -> Vec<Result<RecordBatch>> {
         self.install(|| {
-            (blocks.par_iter())
-                // Each worker reuses one line index from block to block.
-                .map_init(Vec::new, |lines, block| {
-                    lines.clear();
-                    let chosen = framing::lines(&block.bytes).skip(block.skip);
-                    lines.extend(chosen.take(block.take));
-                    self.parse_chunk(unit, lines, block.offset, || block.records_before)
+            (blocks.into_par_iter())
+                .map(|block| {
+                    let block = block.map_err(input::io_error(unit))?;
+                    let lines = framing::lines(&block.bytes).skip(block.skip);
+                    let lines: Vec<_> = lines.take(block.take).collect();
+                    self.parse_chunk(unit, &lines, block.offset, || block.records_before)
                 })
                 .collect()
         })

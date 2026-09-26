@@ -134,8 +134,8 @@ def write_edge_cases(text):
     dos = text.replace("\n", "\r\n").encode("cp1252") + b"\x1a"
     (HERE / "people.cp1252.dos.txt").write_bytes(dos)
 
-    header = "".join(f"{name[:width]:{align}{width}}" for name, width, align, _, _ in COLUMNS)
-    (HERE / "people.cp1252.header.txt").write_bytes(f"{header}\n{text}".encode("cp1252"))
+    header = render_line([name[:width] for name, width, *_ in COLUMNS])
+    (HERE / "people.cp1252.header.txt").write_bytes((header + text).encode("cp1252"))
 
     data = text.encode("cp1252")
     half = len(data) // 2
