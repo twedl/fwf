@@ -4,7 +4,7 @@ This file is the maintained design. It started on 2026-09-26 as an export of a [
 
 ## Context and scope
 
-fwf is a Rust reader for fixed-width files, shaped like the `csv` crate (streaming rows, serde) and polars' CSV reader (columnar, parallel, Arrow output). It is being rewritten from scratch: on 2026-09-26 `main` was reset to a branch cut from the initial commit. The earlier implementation is kept at tag `pre-rewrite` and is not a reference.
+fwf is a Rust reader for fixed-width files, shaped like polars' CSV reader (columnar, parallel, Arrow output). It is being rewritten from scratch: on 2026-09-26 `main` was reset to a branch cut from the initial commit. The earlier implementation is kept at tag `pre-rewrite` and is not a reference.
 
 The target workflow is {zip, gzip, txt, stdin} → fwf → {csv, parquet, stdout}. Work starts on the input side; outputs come later.
 
@@ -24,7 +24,8 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | EBCDIC-037 | Dropped | Not supported. | Not needed. Dropping it removes the only encoding where space, digits and newline differ from ASCII. |
 | Latin-1 | Dropped | Not supported; use `cp1252`. | Identical except bytes 0x80–0x9F, where Latin-1 has control codes that almost never occur in real data. |
 | Scope order | Decided | Input surface first; outputs later. | Keeps the first slice small. |
-| Architecture | Agreed | Shared core + row reader + columnar reader. | See Core architecture. |
+| Architecture | Agreed | Shared core + columnar reader, laid out like polars-io's `csv/read`. | See Core architecture and Crate layout. |
+| Row reader | Dropped | No csv-crate-style row reader (serde, `ByteRecord`) or writer. | Nothing on the path to Arrow and Parquet needs it; add it only if something does. |
 | Input model | Agreed | Every input resolves to units of `Slice` or `Stream`. | See Input surface. |
 
 ## Core architecture
@@ -36,10 +37,62 @@ In FWF the layout gives field boundaries before any byte is read; only record bo
   - `Framing`: `Lines { terminator: Lf | CrLf | Auto }` or `Fixed { record_len }` for files with no line terminators. `Fixed` cuts by bytes, so it needs cp1252, cp850 or pure-ASCII UTF-8.
   - `extract(line, &Column)` returns `Null` or `Value(&[u8])`, and applies the policy for lines shorter than the layout.
   - Byte-level parsers for declared types, one specialized loop per column. v1 has only `Float64`; integers, dates and decimals can come later.
-- **Row reader and writer** (csv-crate shape): `Reader<R: Read>`, reusable `ByteRecord` and `StringRecord`, serde `deserialize`, and a `Writer` driven by the same `Layout`.
 - **Columnar reader** (polars shape): split the input into chunks, find line starts, parse each requested column in its own loop per chunk (rayon), then join the chunks in order into Arrow `RecordBatch`es.
 
-The columnar reader is not built on the row iterator, which would give up the per-column loop. Ship one crate with cargo features; split out a core crate only if something needs it on its own.
+There is no csv-crate-style row reader. Ship one crate with cargo features; split out a core crate only if something needs it on its own.
+
+## Crate layout
+
+One library crate, organized like polars-io's `csv/read` module. The command-line tool comes later, with the output work. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
+
+```
+src/
+  lib.rs          re-exports; read() and scan()
+  error.rs        Error + Position { unit, record, byte, field }
+  schema.rs       JSON → Schema { fields }, DataType { String, Float64 }; unknown type = error
+  options.rs      ReadOptions (schema, columns, skip_rows, n_rows, n_threads, chunk_size)
+                  ParseOptions (encoding, trim, null rule, short-line policy)
+  input/
+    mod.rs        Location, Container, InputOptions, Unit, Input { Slice, Stream }, open()
+    sniff.rs      first bytes → plain | gzip | zip
+    zip.rs        index via the `zip` crate; stored → Slice, deflate/deflate64 → Stream; CRC-32 check
+    stdin.rs      redirected file → mmap; pipe → Stream; zip on a pipe → temp file
+  encoding.rs     Encoding { Utf8, Cp1252, Cp850 }: character span → byte range, bytes → UTF-8
+  tables.rs       the two 128-entry code-page tables, generated from Python's codecs and checked in
+  framing.rs      per unit: BOM, \n vs \r\n, trailing 0x1A, line starts (memchr), chunk boundaries
+  field.rs        one field from one line: slice, trim, null, short line
+  builder.rs      column builders → Arrow arrays
+  read_impl.rs    parse_chunk(bytes) → RecordBatch; slice path (parallel) and stream path
+  reader.rs       Reader: scan() → impl RecordBatchReader; read() = scan() collected
+tests/
+  fixtures/…
+  read.rs         every fixture with people.schema.json == people.expected.json
+```
+
+| polars-io `csv/read/` | fwf | What changes |
+| --- | --- | --- |
+| `options.rs` | `options.rs` | No separator, quote or comment options. Adds encoding, trim, null rule and short-line policy. |
+| `schema_inference.rs` | `schema.rs` | Reads the JSON schema; nothing is inferred. |
+| `parser.rs` | `framing.rs` | Any `\n` ends a record, since nothing is quoted. Adds BOM, `\r\n` and `0x1A` handling. |
+| `splitfields.rs` | `field.rs` | A field is a slice at a known position, then trim and null checks. |
+| `builder.rs` | `builder.rs` | Only `String` and `Float64`. The `String` builder transcodes cp1252/cp850, not just validates UTF-8. |
+| `read_impl.rs` | `read_impl.rs` | Same chunk-and-rayon shape; chunk boundaries never need checking. |
+| `reader.rs` | `reader.rs` | Produces Arrow `RecordBatch`es, not a `DataFrame`. |
+| `utils.rs` (`decompress`), `streaming.rs` | `input/` | Much larger: zip members, deflate64, stdin vs. pipe, units. |
+| `CsvEncoding { Utf8, LossyUtf8 }` | `encoding.rs` | New: code pages, and character positions for UTF-8. |
+| polars-stream `io_sources/csv/` | stream path in `read_impl.rs` | Same split between reading line batches and parsing them, without a query engine. |
+
+**Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an iterator of `RecordBatch`es, with column selection and `n_rows` as plain options, and `read()` collects it. One `parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
+
+**Dependencies:** `arrow-array` and `arrow-schema` (not the full `arrow` crate), `rayon`, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `globset`, `serde` and `serde_json`.
+
+**Build order**, each step checked against the fixtures:
+
+1. `schema.rs`: load `people.schema.json`; reject `people.schema.unknown-type.json`.
+2. `encoding.rs` + `tables.rs`: tables checked against Python; character-to-byte offsets for UTF-8.
+3. `framing.rs`, `field.rs`, `builder.rs`, `read_impl.rs`, single-threaded, on plain `.txt`: all three `people.*.txt` decode to `people.expected.json`.
+4. `input/`: gzip, zip (deflate and deflate64), stdin (pipe and redirect).
+5. Parallel chunks.
 
 ## Input surface
 
@@ -99,7 +152,7 @@ The `zip` crate is used only to read the archive's index. Each member's bytes ar
 
 ### Encoding
 
-The encoding only matters when a string field is converted to UTF-8.
+All three encodings are ASCII-compatible, so framing, trimming, null checks and `Float64` parsing work on raw bytes. The encoding matters in two places: finding a field's byte range (UTF-8 only) and converting a `String` field to UTF-8. It is chosen once per chunk, and the per-column loop is generic over it.
 
 - `utf-8` (default) is strict. Invalid bytes raise an error that gives the position and suggests `--encoding cp850` or `cp1252`.
 - `cp1252` and `cp850`: bytes below 0x80 are ASCII, and bytes from 0x80 up come from a 128-entry table. Pure-ASCII fields are copied straight through. No crate is needed; `encoding_rs` does not include CP850.
@@ -127,7 +180,7 @@ Not started. These are notes from the discussion to pick up later.
 - **Contract:** the parser produces an ordered stream of Arrow `RecordBatch`es (arrow's `RecordBatchReader`). Every destination consumes it. Custom destinations use it directly, so there is no `Sink` trait.
 - **Format vs. destination:** `OutKind { Csv, Parquet }` × `OutLoc { Path, Stdout }`. Both formats are generic over `W: Write + Send`.
 - **Parquet:** `parquet::arrow::ArrowWriter`. It works on stdout because the footer is written last. Refuse binary output to a terminal unless `--force`.
-- **CSV:** `arrow_csv::Writer`. Add a row reader → `csv::Writer` fast path only if profiling shows the Arrow round trip matters.
+- **CSV:** `arrow_csv::Writer`. Add a direct fast path that skips Arrow only if profiling shows the round trip matters.
 - **Files:** write to a temp file and rename on success. Stdout can't be atomic; the exit code is the signal.
 - **Stdout:** wrap in `BufWriter` (Rust's stdout flushes every line), exit quietly on `BrokenPipe`, and send everything except data to stderr.
 - **In-memory use from Python or polars:** export through the Arrow C Stream interface (`__arrow_c_stream__`).
@@ -155,6 +208,8 @@ Not started. These are notes from the discussion to pick up later.
 Each input item below fits into resolution steps 1–3 later without touching the parser.
 
 - Type guessing and width inference.
+- A csv-crate-style row reader (serde, `ByteRecord`) and writer.
+- The command-line tool, until the output work starts.
 - Types other than `String` and `Float64` (integers, dates, decimals).
 - Layouts written as start–end ranges or width lists.
 - Parsing several units at once; it mostly helps zips with many deflated members.
