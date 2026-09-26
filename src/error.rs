@@ -32,6 +32,13 @@ pub enum Error {
     /// A `String` column holds more than the 2 GiB of text one record batch
     /// can, so `read()` can't join it; `scan()` reads it in smaller batches.
     TooLarge,
+    /// The output couldn't be written: its file couldn't be created or
+    /// replaced, a write failed, or the batches couldn't be written in the
+    /// format (an `io::Error` of kind `Other`).
+    Write {
+        destination: String,
+        source: std::io::Error,
+    },
 }
 
 /// Where in the input a value failed to read.
@@ -89,6 +96,10 @@ impl fmt::Display for Error {
                 "a String column holds more than 2 GiB of text, too much for one record \
                  batch; read it in batches with scan()"
             ),
+            Error::Write {
+                destination,
+                source,
+            } => write!(f, "{destination}: {source}"),
         }
     }
 }
@@ -97,7 +108,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::SchemaJson(e) => Some(e),
-            Error::Io { source, .. } => Some(source),
+            Error::Io { source, .. } | Error::Write { source, .. } => Some(source),
             _ => None,
         }
     }

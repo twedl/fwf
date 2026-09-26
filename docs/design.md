@@ -6,7 +6,7 @@ This file is the maintained design. It started on 2026-09-26 as an export of a [
 
 fwf is a Rust reader for cp1252 and cp850 fixed-width files, shaped like polars' CSV reader (columnar, parallel, Arrow output). For UTF-8 files, use polars directly. It is being rewritten from scratch: on 2026-09-26 `main` was reset to a branch cut from the initial commit. The earlier implementation is kept at tag `pre-rewrite` and is not a reference.
 
-The target workflow is {zip, gzip, txt, stdin} → fwf → {csv, parquet, stdout}. Work starts on the input side; outputs come later.
+The target workflow is {zip, gzip, txt, stdin} → fwf → {csv, parquet, stdout}. Work started on the input side; outputs followed in step 7.
 
 ## Decision log
 
@@ -37,6 +37,12 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Scan | Agreed | `scan()` returns `Box<dyn RecordBatchReader + Send>`. Opening errors come from `scan()`; parsing errors come from the reader as `ArrowError::ExternalError` holding an `fwf::Error`, and nothing is read after one. `read()` collects the same batches. | Arrow's reader trait is what arrow-csv, parquet and the Arrow C Stream interface take. |
 | Lazy parsing | Agreed | An in-memory unit is parsed 4 chunks per thread at a time, when the batches are asked for. | Bounds `scan()`'s memory (about 32 MiB of input on 8 threads) for about 5% on `read()`; see Parsing order. |
 | Parallel errors | Agreed | If several chunks fail, the error reported is the first in the unit. | Errors stay the same from run to run, whichever thread finds one first. |
+| Output API | Agreed | `write(batches, format, destination)` takes any Arrow `RecordBatchReader`, with `Format { Csv, Parquet }` and `Destination { Path, Stdout }`. | Every destination consumes the batches `scan()` yields. Custom destinations use those directly, so there is no `Sink` trait. |
+| Parquet compression | Decided | zstd at level 3, zstd's own default. | Chosen on 2026-09-26. Polars also defaults to zstd, while the parquet crate's default is uncompressed. |
+| Terminal check | Decided | The CLI (step 8) refuses to write Parquet to a terminal unless given `--force`. The library writes wherever it's told. | Chosen on 2026-09-26. The rule protects a person at a shell. |
+| Cargo features | Decided | `arrow-csv` and `parquet` are always compiled, with no cargo features. | Chosen on 2026-09-26. A feature can come later if a library user wants only reading. |
+| Output files | Agreed | Written to a temp file beside the destination, which is renamed over it only when everything is written. The file gets a new file's permissions. | After an error, the destination is as it was. |
+| Closed stdout | Agreed | When the reader of stdout closes the pipe, the write ends without an error. | `fwf … \| head` is ordinary use. |
 
 ## Core architecture
 
@@ -72,11 +78,11 @@ After step 6, on a regenerated file of the same shape (301.5 MB, the same M1, be
 
 ## Crate layout
 
-One library crate, organized like polars-io's `csv/read` module. The command-line tool comes later, with the output work. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
+One library crate, organized like polars-io's `csv/read` module. The command-line tool comes in step 8. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
 
 ```
 src/
-  lib.rs          re-exports; read() and scan()
+  lib.rs          re-exports; read(), scan() and write()
   error.rs        Error + Position { unit, record, byte, field }
   schema.rs       JSON → Schema { fields }, DataType { String, Float64 }; unknown type = error
   options.rs      ReadOptions: schema, encoding, container, entry, columns, skip_rows, n_rows,
@@ -97,9 +103,12 @@ src/
                   time into one RecordBatch, when it's asked for
   reader.rs       read(location) → one RecordBatch (concat_batches); scan(location) →
                   RecordBatchReader
+  writer.rs       write(batches, format, destination): CSV (arrow-csv) or Parquet (ArrowWriter,
+                  zstd) to a file (temp file + rename) or stdout
 tests/
   fixtures/…
   read.rs         every fixture with people.schema.json == people.expected.json
+  write.rs        CSV text, Parquet read back, and what a failed write leaves
 scripts/
   gen_tables.py   writes src/tables.rs from Python's codecs
 ```
@@ -119,9 +128,9 @@ scripts/
 
 **Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an Arrow `RecordBatchReader`, with column selection and `n_rows` as plain options, and `read()` collects the same batches. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel, a few per thread at a time as the reader asks; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
 
-**Dependencies:** `arrow-array`, `arrow-schema` and `arrow-select` (not the full `arrow` crate), `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`.
+**Dependencies:** `arrow-array`, `arrow-schema`, `arrow-select` and `arrow-csv` (not the full `arrow` crate), `parquet` with only its `arrow` and `zstd` features, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`.
 
-**Build order**, each step checked against the fixtures. Steps 1–6 are done (as of 2026-09-26); 7 onward is the plan.
+**Build order**, each step checked against the fixtures. Steps 1–7 are done (as of 2026-09-26); 8 onward is the plan.
 
 1. Done. `schema.rs`: load `people.schema.json`; reject `people.schema.unknown-type.json`.
 2. Done. `encoding.rs` + `tables.rs`: tables checked against Python.
@@ -129,13 +138,13 @@ scripts/
 4. Done. `input/`: gzip, zip (stored, deflate and deflate64), stdin (pipe and redirect), bytes and readers.
 5. Done. Chunked, parallel, column-at-a-time parsing: in-memory units in chunks of about 1 MiB cut after a line ending, streams a block at a time with the rest of the last line carried over, and error positions kept exact across chunks. Unit tests parse the fixtures with chunks as small as one byte.
 6. Done. `scan(location, &options)` returns an Arrow `RecordBatchReader` yielding one batch per chunk, parsed as it's asked for; `read()` collects the same batches. `ReadOptions` gained `with_columns`, `with_skip_rows`, `with_n_rows`, `with_chunk_size` and `with_n_threads`. Each read takes one unit: `with_entry` names a zip member exactly, replacing `with_entries` globs. Past 2 GiB of text in a column, `read()` returns `Error::TooLarge` instead of panicking.
-7. **Outputs.** CSV (`arrow-csv`) and Parquet (`parquet::arrow::ArrowWriter`) to a file or stdout, per Output surface: temp file + rename for files, `BufWriter` and quiet `BrokenPipe` handling for stdout, no binary output to a terminal without `--force`.
-8. **Command line.** `fwf convert [INPUT] --layout schema.json --encoding cp1252|cp850 [--input-format] [--entry NAME] [-o OUTPUT] [--format csv|parquet]`, stdin and stdout by default, progress and errors on stderr. Behind a cargo feature so library users don't compile `clap`.
+7. Done. `write(batches, format, destination)` writes CSV (`arrow-csv`) or Parquet (`parquet::arrow::ArrowWriter`, zstd) to a file or stdout, per Output surface: a temp file renamed into place for files, and a closed pipe on stdout ends the write without an error.
+8. **Command line.** `fwf convert [INPUT] --layout schema.json --encoding cp1252|cp850 [--input-format] [--entry NAME] [-o OUTPUT] [--format csv|parquet] [--force]`, stdin and stdout by default, progress and errors on stderr. It refuses to write Parquet to a terminal unless given `--force`. Behind a cargo feature so library users don't compile `clap`.
 9. **Hardening and extras**, as needed:
     - Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip.
     - Python / polars: export batches through the Arrow C Stream interface, or a polars IO plugin (`register_io_source`) for `scan_fwf`.
     - More types (`Int64`, `Date`, `Decimal`), `--no-mmap`, and several record types per file (still an open question).
-    - Performance, if profiling points there: parsing a stream's blocks in parallel while the next is decompressed, the stored-member CRC pass at open (it delays the first chunk), and a faster `Float64` parser.
+    - Performance, if profiling points there: writing CSV and Parquet on several threads (writing takes 90–95% of a conversion; see Output surface), parsing while the writer writes, parsing a stream's blocks in parallel while the next is decompressed, the stored-member CRC pass at open (it delays the first chunk), and a faster `Float64` parser.
 
 ## Input surface
 
@@ -224,17 +233,29 @@ fwf convert [INPUT] --layout schema.json
 
 One input for now, like the library.
 
-## Output surface (deferred)
+## Output surface
 
-Not started. These are notes from the discussion to pick up later.
+`write()` takes any Arrow `RecordBatchReader`, usually the one `scan()` returns, and writes its batches as CSV or Parquet to a file or stdout.
 
-- **Contract:** the parser produces an ordered stream of Arrow `RecordBatch`es (arrow's `RecordBatchReader`). Every destination consumes it. Custom destinations use it directly, so there is no `Sink` trait.
-- **Format vs. destination:** `OutKind { Csv, Parquet }` × `OutLoc { Path, Stdout }`. Both formats are generic over `W: Write + Send`.
-- **Parquet:** `parquet::arrow::ArrowWriter`. It works on stdout because the footer is written last. Refuse binary output to a terminal unless `--force`.
-- **CSV:** `arrow_csv::Writer`. Add a direct fast path that skips Arrow only if profiling shows the round trip matters.
-- **Files:** write to a temp file and rename on success. Stdout can't be atomic; the exit code is the signal.
-- **Stdout:** wrap in `BufWriter` (Rust's stdout flushes every line), exit quietly on `BrokenPipe`, and send everything except data to stderr.
-- **In-memory use from Python or polars:** export through the Arrow C Stream interface (`__arrow_c_stream__`).
+```rust
+pub enum Format      { Csv, Parquet }
+pub enum Destination { Path(PathBuf), Stdout }   // From<&str>, &Path, PathBuf
+
+pub fn write(batches: impl RecordBatchReader, format: Format, destination: impl Into<Destination>) -> Result<()>;
+
+// fwf::write(fwf::scan("data.zip", &options)?, Format::Parquet, "data.parquet")?;
+```
+
+- **Contract:** every destination consumes the same ordered batches. Custom destinations use `scan()`'s reader directly, so there is no `Sink` trait.
+- **CSV:** `arrow_csv::Writer` with its defaults: commas, a header row, `\n` line endings and no quotes unless a value needs them. A null is an empty field, and a `Float64` is written as Arrow prints it (`1234.5`, `7.0`). An input with no records still gets the header. A direct fast path that skips Arrow is worth adding only if profiling shows the round trip matters.
+- **Parquet:** `parquet::arrow::ArrowWriter` with zstd at level 3 and the crate's other defaults (row groups of up to 1,048,576 rows, dictionary encoding, page statistics). The Arrow schema is embedded, so readers get `Utf8` and `Float64` columns back. The footer comes last, so Parquet works on stdout.
+- **Files:** written to a temp file in the destination's directory, which is renamed over the destination once everything is written and flushed. After an error, the destination is as it was and the temp file is removed. On Unix the file gets a new file's permissions (0666 less the umask), not a temp file's 0600. It isn't fsynced. A process killed mid-write, as by Ctrl-C, leaves its `.tmp…` file behind.
+- **Stdout:** it can't be replaced atomically, so the exit code is the signal. When the reader closes the pipe (`fwf … | head`), the write ends without an error and nothing more is parsed. Both formats write through a 1 MiB buffer.
+- **Errors:** a parsing error from `scan()` comes back as the `fwf::Error` it was (for example `InvalidByte`), not wrapped. Anything else is `Error::Write { destination, source }`, where the destination is the path or `-`. The source is an `io::Error`: the one a write hit, or, when the batches can't be written in the format, the Arrow or Parquet error as kind `Other`. The format writers can turn an I/O error into text (arrow-csv keeps only the text when writing a record fails), so the writer is wrapped to keep the error itself, which is also how a closed pipe is recognized.
+- **Terminal:** the library writes Parquet wherever it's told. Refusing a terminal without `--force` is the CLI's job (step 8).
+- **In-memory use from Python or polars:** export through the Arrow C Stream interface (`__arrow_c_stream__`), in step 9.
+
+Measured after step 7 on the file from step 6 (40 fields, 301.5 MB, the same M1 with all 8 threads): draining `scan()` took 148 ms, writing CSV to a file 2.88–2.93 s (316 MB), and writing Parquet 1.42–1.44 s (38.5 MB). The writers run on one thread and take 90–95% of the time. Parsing doesn't overlap with them: the reader parses a few chunks per thread, then waits until the writer asks for more. The 1 MiB buffer took CSV from 2.99 s to 2.88–2.90 s and left Parquet unchanged, since both writers already buffer 8 KiB. Peak memory was 392 MB for CSV, 468 MB for Parquet and 384 MB for `scan()` alone, most of it the mapped file.
 
 ## Test fixtures
 
@@ -259,7 +280,6 @@ Each input item below fits into resolution steps 1–3 later without touching th
 
 - Type guessing and width inference.
 - A csv-crate-style row reader (serde, `ByteRecord`) and writer.
-- The command-line tool, until the output work starts.
 - Types other than `String` and `Float64` (integers, dates, decimals).
 - Layouts written as start–end ranges or width lists.
 - Reading several inputs or zip members in one read, and parsing them at once.
@@ -267,4 +287,3 @@ Each input item below fits into resolution steps 1–3 later without touching th
 - Loading a whole decompressed file into memory to get exact parallel splits.
 - Nested archives, zip methods other than stored, deflate and deflate64, encrypted zips, and standalone zstd or bzip2 files.
 - UTF-8 (use polars directly), EBCDIC, Latin-1 and other code pages.
-- All output work (see Output surface).
