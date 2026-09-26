@@ -7,6 +7,7 @@ mod encoding;
 mod error;
 mod field;
 mod framing;
+mod input;
 mod options;
 mod read_impl;
 mod reader;
@@ -15,6 +16,7 @@ mod tables;
 
 pub use encoding::Encoding;
 pub use error::{Error, Position, Result};
+pub use input::{Container, Location};
 pub use options::ReadOptions;
 pub use reader::read;
 pub use schema::{DataType, Field, Schema};

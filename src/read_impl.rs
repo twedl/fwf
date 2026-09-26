@@ -6,41 +6,63 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use crate::builder::Builder;
 use crate::{Position, ReadOptions, Result, field, framing};
 
-/// Parses one unit's bytes into a record batch, a record at a time, pushing
-/// each field into its column's builder.
-pub(crate) fn parse(unit: &str, bytes: &[u8], options: &ReadOptions) -> Result<RecordBatch> {
-    let fields = options.schema.fields();
-    let mut builders: Vec<Builder> = fields.iter().map(|f| Builder::new(f.dtype)).collect();
-    let mut scratch = String::new();
-    let mut records = 0;
-    for (line_start, line) in framing::lines(framing::strip_eof_marker(bytes)) {
-        records += 1;
-        for (field, builder) in fields.iter().zip(&mut builders) {
-            let (at, value) = field::value(line, field.start, field.len);
-            if value.is_empty() {
-                builder.append_null();
-                continue;
-            }
-            builder.append(value, options.encoding, &mut scratch, |offset| Position {
-                unit: unit.to_owned(),
-                record: records,
-                field: field.name.clone(),
-                byte: line_start + at + offset,
-            })?;
+/// Parses units into one record batch, a record at a time, pushing each field
+/// into its column's builder.
+pub(crate) struct Parser<'a> {
+    options: &'a ReadOptions,
+    builders: Vec<Builder>,
+    scratch: String,
+    rows: usize,
+}
+
+impl<'a> Parser<'a> {
+    pub(crate) fn new(options: &'a ReadOptions) -> Parser<'a> {
+        let fields = options.schema.fields();
+        Parser {
+            options,
+            builders: fields.iter().map(|f| Builder::new(f.dtype)).collect(),
+            scratch: String::new(),
+            rows: 0,
         }
     }
 
-    let columns: Vec<_> = builders.iter_mut().map(Builder::finish).collect();
-    let arrow_fields: Vec<ArrowField> = (fields.iter().zip(&columns))
-        .map(|(f, column)| ArrowField::new(&f.name, column.data_type().clone(), true))
-        .collect();
-    // The row count keeps a schema with no fields from failing.
-    let batch_options = RecordBatchOptions::new().with_row_count(Some(records));
-    let schema = Arc::new(ArrowSchema::new(arrow_fields));
-    Ok(
+    /// Appends one unit's records. Errors count records from the unit's start.
+    pub(crate) fn parse(&mut self, unit: &str, bytes: &[u8]) -> Result<()> {
+        let fields = self.options.schema.fields();
+        let mut records = 0;
+        for (line_start, line) in framing::lines(framing::strip_eof_marker(bytes)) {
+            records += 1;
+            for (field, builder) in fields.iter().zip(&mut self.builders) {
+                let (at, value) = field::value(line, field.start, field.len);
+                if value.is_empty() {
+                    builder.append_null();
+                    continue;
+                }
+                builder.append(value, self.options.encoding, &mut self.scratch, |offset| {
+                    Position {
+                        unit: unit.to_owned(),
+                        record: records,
+                        field: field.name.clone(),
+                        byte: line_start + at + offset,
+                    }
+                })?;
+            }
+        }
+        self.rows += records;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> RecordBatch {
+        let columns: Vec<_> = self.builders.iter_mut().map(Builder::finish).collect();
+        let arrow_fields: Vec<ArrowField> = (self.options.schema.fields().iter().zip(&columns))
+            .map(|(f, column)| ArrowField::new(&f.name, column.data_type().clone(), true))
+            .collect();
+        // The row count keeps a schema with no fields from failing.
+        let batch_options = RecordBatchOptions::new().with_row_count(Some(self.rows));
+        let schema = Arc::new(ArrowSchema::new(arrow_fields));
         RecordBatch::try_new_with_options(schema, columns, &batch_options)
-            .expect("each field has its column"),
-    )
+            .expect("each field has its column")
+    }
 }
 
 #[cfg(test)]
@@ -49,12 +71,13 @@ mod tests {
     use crate::{Encoding, Schema};
 
     fn read(json: &str, bytes: &[u8]) -> Result<RecordBatch> {
-        let schema = Schema::from_json(json.as_bytes()).unwrap();
-        parse(
-            "test.txt",
-            bytes,
-            &ReadOptions::new(schema, Encoding::Cp1252),
-        )
+        let options = ReadOptions::new(
+            Schema::from_json(json.as_bytes()).unwrap(),
+            Encoding::Cp1252,
+        );
+        let mut parser = Parser::new(&options);
+        parser.parse("test.txt", bytes)?;
+        Ok(parser.finish())
     }
 
     #[test]

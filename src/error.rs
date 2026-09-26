@@ -14,6 +14,12 @@ pub enum Error {
     ZeroLength { field: String },
     /// Two fields have the same name.
     DuplicateName { field: String },
+    /// An entry pattern isn't a valid glob.
+    InvalidEntryPattern { pattern: String, message: String },
+    /// A zip archive can't be used: its index is unreadable, a member is
+    /// encrypted or uses another compression method, or the entries don't pick
+    /// the files to read. Data that fails its CRC-32 is an `Io` error.
+    Archive { unit: String, message: String },
     /// The input couldn't be read.
     Io {
         unit: String,
@@ -64,6 +70,10 @@ impl fmt::Display for Error {
             ),
             Error::ZeroLength { field } => write!(f, "field {field:?}: length is 0"),
             Error::DuplicateName { field } => write!(f, "field {field:?} appears more than once"),
+            Error::InvalidEntryPattern { pattern, message } => {
+                write!(f, "invalid entry pattern {pattern:?}: {message}")
+            }
+            Error::Archive { unit, message } => write!(f, "{unit}: {message}"),
             Error::Io { unit, source } => write!(f, "{unit}: {source}"),
             // cp1252's undefined bytes are common letters in cp850 (ü, ì, Å, É, Ø).
             Error::InvalidByte { position, byte } => write!(

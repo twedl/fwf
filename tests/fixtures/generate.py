@@ -15,6 +15,12 @@ the rest have no type, so they default to String.
 
 people.schema.unknown-type.json misspells Float64; readers must reject it.
 
+Three more zips cover the rest of the input rules: people.cp1252.stored.zip
+(an uncompressed member), people.cp1252.lzma.zip (a compression method readers
+must reject by name), and people.multi.zip (a directory, parts/1.txt and
+parts/2.txt holding the cp850 records, and a README.txt, to test choosing
+members).
+
 Needs 7z (p7zip) for the deflate64 zips, since Python's zipfile can't write
 them. Output is deterministic: running this again leaves git clean.
 """
@@ -107,12 +113,15 @@ def write_expected():
     write_json_lines(HERE / "people.expected.json", "[", records, "]")
 
 
-def write_deflate_zip(path, member, data):
-    info = zipfile.ZipInfo(member, date_time=ZIP_TIME)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.external_attr = 0o100644 << 16
+def write_zip(path, members, method=zipfile.ZIP_DEFLATED):
+    """Members are (name, data) pairs; a name ending in "/" is a directory."""
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr(info, data)
+        for name, data in members:
+            info = zipfile.ZipInfo(name, date_time=ZIP_TIME)
+            info.compress_type = method
+            is_dir = name.endswith("/")
+            info.external_attr = (0o40755 << 16 | 0x10) if is_dir else 0o100644 << 16
+            zf.writestr(info, data)
 
 
 def write_deflate64_zip(path, member, data):
@@ -131,13 +140,13 @@ def write_deflate64_zip(path, member, data):
 
 
 def check_zip(path, member, data, method):
-    """Python can't decompress deflate64, so check its method, size and CRC."""
+    """Python can't decompress deflate64, so for it check the method, size and CRC."""
     with zipfile.ZipFile(path) as zf:
         [info] = zf.infolist()
         assert info.filename == member, info.filename
         assert info.compress_type == method, f"{path.name}: method {info.compress_type}"
         assert info.file_size == len(data) and info.CRC == zlib.crc32(data), path.name
-        if method == zipfile.ZIP_DEFLATED:
+        if method != 9:
             assert zf.read(member) == data, path.name
 
 
@@ -152,11 +161,24 @@ def main():
         (HERE / f"{member}.gz").write_bytes(gzip.compress(data, mtime=0))
         deflate = HERE / f"people.{encoding}.deflate.zip"
         deflate64 = HERE / f"people.{encoding}.deflate64.zip"
-        write_deflate_zip(deflate, member, data)
+        write_zip(deflate, [(member, data)])
         write_deflate64_zip(deflate64, member, data)
         assert gzip.decompress((HERE / f"{member}.gz").read_bytes()) == data
         check_zip(deflate, member, data, zipfile.ZIP_DEFLATED)
         check_zip(deflate64, member, data, 9)  # 9 = Deflate64
+
+    cp1252, cp850 = text.encode("cp1252"), text.encode("cp850")
+    member = "people.cp1252.txt"
+    for kind, method in [("stored", zipfile.ZIP_STORED), ("lzma", zipfile.ZIP_LZMA)]:
+        path = HERE / f"people.cp1252.{kind}.zip"
+        write_zip(path, [(member, cp1252)], method)
+        check_zip(path, member, cp1252, method)
+    readme = b"Two copies of people.cp850.txt.\n"
+    multi = [("parts/", b""), ("parts/1.txt", cp850), ("parts/2.txt", cp850), ("README.txt", readme)]
+    write_zip(HERE / "people.multi.zip", multi)
+    with zipfile.ZipFile(HERE / "people.multi.zip") as zf:
+        assert [i.filename for i in zf.infolist()] == [name for name, _ in multi]
+        assert zf.getinfo("parts/").is_dir() and zf.read("parts/2.txt") == cp850
 
 
 if __name__ == "__main__":
