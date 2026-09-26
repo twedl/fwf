@@ -1,12 +1,12 @@
 # fwf rewrite: design decisions
 
-Exported on 2026-09-26 from the [design doc](https://claude.ai/code/artifact/87dd86a4-6d4d-4772-ba14-dc201d729b60), and updated here since.
+This file is the maintained design. It started on 2026-09-26 as an export of a [Claude Doc](https://claude.ai/code/artifact/87dd86a4-6d4d-4772-ba14-dc201d729b60), which is no longer updated.
 
 ## Context and scope
 
 fwf is a Rust reader for fixed-width files, shaped like the `csv` crate (streaming rows, serde) and polars' CSV reader (columnar, parallel, Arrow output). It is being rewritten from scratch: on 2026-09-26 `main` was reset to a branch cut from the initial commit. The earlier implementation is kept at tag `pre-rewrite` and is not a reference.
 
-The target workflow is {zip, txt, stdin} → fwf → {csv, parquet, stdout}. Work starts on the input side; outputs come later.
+The target workflow is {zip, gzip, txt, stdin} → fwf → {csv, parquet, stdout}. Work starts on the input side; outputs come later.
 
 ## Decision log
 
@@ -134,7 +134,7 @@ Not started. These are notes from the discussion to pick up later.
 
 ## Test fixtures
 
-`tests/fixtures/generate.py` writes one set of records in every encoding (utf-8, cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`). Stdin tests pipe or redirect the same files. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run.
+`tests/fixtures/generate.py` writes one set of records in every encoding (utf-8, cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`). Stdin tests pipe or redirect the same files. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run. `.gitattributes` marks the fixtures `-text`, so git never converts their line endings (it would add `\r` on a clone with `core.autocrlf=true`).
 
 ## Open questions
 
@@ -155,6 +155,8 @@ Not started. These are notes from the discussion to pick up later.
 Each input item below fits into resolution steps 1–3 later without touching the parser.
 
 - Type guessing and width inference.
+- Types other than `String` and `Float64` (integers, dates, decimals).
+- Layouts written as start–end ranges or width lists.
 - Parsing several units at once; it mostly helps zips with many deflated members.
 - `--no-mmap`. Mapping can crash (SIGBUS) if the file is truncated mid-read, and network filesystems are another reason to want it.
 - Loading a whole decompressed file into memory to get exact parallel splits.
