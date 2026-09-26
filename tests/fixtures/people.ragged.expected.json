@@ -1,0 +1,11 @@
+[
+  {"id": "000001", "name": "José García", "city": "Málaga", "born": "19850312", "amount": 1234.5, "code": "ES"},
+  {"id": "000002", "name": "Zoë Müller", "city": "Zürich", "born": "19900101", "amount": 99.99, "code": "CH"},
+  {"id": "000003", "name": "Françoise Lefèvre", "city": "Besançon", "born": "19771231", "amount": 0.0, "code": "FR"},
+  {"id": "000004", "name": "Åsa Ström", "city": "Göteborg", "born": "20010704", "amount": 1000000.0, "code": "SE"},
+  {"id": null, "name": null, "city": null, "born": null, "amount": null, "code": null},
+  {"id": "000005", "name": "Þór Guðmundsson", "city": "Reykjavík", "born": "19650228", "amount": -42.1, "code": "IS"},
+  {"id": "000006", "name": "Maximilian Straßberg", "city": "Düss", "born": null, "amount": null, "code": null},
+  {"id": "000007", "name": "Ana Brandão", "city": null, "born": "19930615", "amount": 350.25, "code": "PT"},
+  {"id": "000008", "name": "John Smith", "city": "Leeds", "born": "19991231", "amount": 12.0, "code": null}
+]

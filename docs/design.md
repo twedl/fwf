@@ -138,7 +138,7 @@ scripts/
 
 **Dependencies:** `arrow-array`, `arrow-schema`, `arrow-select` and `arrow-csv` (not the full `arrow` crate), `parquet` with only its `arrow` and `zstd` features, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`. `clap` with the default `cli` feature.
 
-**Build order**, each step checked against the fixtures. Steps 1–8 are done (as of 2026-09-26); 9 is the plan.
+**Build order**, each step checked against the fixtures. Steps 1–8 are done (as of 2026-09-26), and step 9 is under way.
 
 1. Done. `schema.rs`: load `people.schema.json`; reject `people.schema.unknown-type.json`.
 2. Done. `encoding.rs` + `tables.rs`: tables checked against Python.
@@ -149,7 +149,7 @@ scripts/
 7. Done. `write(batches, format, destination)` writes CSV (`arrow-csv`) or Parquet (`parquet::arrow::ArrowWriter`, zstd) to a file or stdout, per Output surface: a temp file renamed into place for files, and a closed pipe on stdout returned as a `BrokenPipe` error.
 8. Done. The `fwf` command, per Command line: `scan()` into `write()`, stdin and stdout by default, errors on stderr. It refuses to write Parquet to a terminal unless given `--force`, and exits quietly when the reader of stdout closes the pipe. It's built with the `cli` feature, which is on by default.
 9. **Hardening and extras**, as needed:
-    - Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip.
+    - Done. Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip (see Test fixtures). They passed without changes to the reader.
     - Python / polars: export batches through the Arrow C Stream interface, or a polars IO plugin (`register_io_source`) for `scan_fwf`.
     - More types (`Int64`, `Date`, `Decimal`), `--no-mmap`, and several record types per file (still an open question).
     - Performance, if profiling points there: writing CSV and Parquet on several threads (writing takes 90–95% of a conversion; see Output surface), parsing while the writer writes, parsing a stream's blocks in parallel while the next is decompressed, the stored-member CRC pass at open (it delays the first chunk), and a faster `Float64` parser.
@@ -271,7 +271,7 @@ Measured after step 7 on the file from step 6 (40 fields, 301.5 MB, the same M1 
 
 ## Test fixtures
 
-`tests/fixtures/generate.py` writes one set of records in every encoding (cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`), plus `people.cp1252.stored.zip`, `people.cp1252.lzma.zip` (a method to reject) and `people.multi.zip` (a directory, `parts/1.txt`, `parts/2.txt` and `README.txt`, for choosing a member). Stdin was checked by hand with pipes and redirects; the tests cover a pipe and a mapped file directly. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run. `.gitattributes` marks the fixtures `-text`, so git never converts their line endings (it would add `\r` on a clone with `core.autocrlf=true`).
+`tests/fixtures/generate.py` writes one set of records in every encoding (cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`), plus `people.cp1252.stored.zip`, `people.cp1252.lzma.zip` (a method to reject) and `people.multi.zip` (a directory, `parts/1.txt`, `parts/2.txt` and `README.txt`, for choosing a member). Stdin was checked by hand with pipes and redirects; the tests cover a pipe and a mapped file directly. Every data file above must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. Four cp1252 files cover the framing rules, each read from bytes (parsed in parallel) and from a reader (streamed): `people.cp1252.dos.txt` has `\r\n` endings and a trailing `0x1A`; `people.cp1252.header.txt` has a line of column names, which `skip_rows(1)` skips; `people.cp1252.multi.txt.gz` is two gzip members split inside a record; and `people.cp1252.ragged.txt` has trailing spaces trimmed (so the last record is short), a blank line and a line cut off inside a field. The first three decode to `people.expected.json`, and the ragged file to `people.ragged.expected.json`. The script needs `7z` for deflate64 and writes identical bytes on every run. `.gitattributes` marks the fixtures `-text`, so git never converts their line endings (it would add `\r` on a clone with `core.autocrlf=true`).
 
 ## Open questions
 

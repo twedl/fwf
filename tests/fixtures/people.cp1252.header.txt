@@ -1,0 +1,9 @@
+id    name                city           born        amountco
+000001José García         Málaga         19850312   1234.50ES
+000002Zoë Müller          Zürich         19900101     99.99CH
+000003Françoise Lefèvre   Besançon       19771231      0.00FR
+000004Åsa Ström           Göteborg       200107041000000.00SE
+000005Þór Guðmundsson     Reykjavík      19650228    -42.10IS
+000006Maximilian StraßbergDüsseldorf     19881111      7.00DE
+000007Ana Brandão                        19930615    350.25PT
+000008John Smith          Leeds          19991231     12.00  

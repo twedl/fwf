@@ -7,8 +7,9 @@ deflate64 .zip). Stdin tests pipe or redirect these same files.
 
 Both encodings use one byte per character, so widths are bytes.
 
-Every data file decodes to the records in people.expected.json, where a
-blank field is null, using the schema in people.schema.json. Each schema
+Every data file but one (people.cp1252.ragged.txt, below) decodes to the
+records in people.expected.json, where a blank field is null, using the schema
+in people.schema.json. Each schema
 field has a name, a 1-based position and a length, plus a description that
 readers must ignore. `amount` is Float64, `name` is String explicitly, and
 the rest have no type, so they default to String.
@@ -20,6 +21,17 @@ Three more zips cover the rest of the input rules: people.cp1252.stored.zip
 must reject by name), and people.multi.zip (a directory, parts/1.txt and
 parts/2.txt holding the cp850 records, and a README.txt, to test choosing
 members).
+
+Four more cp1252 files cover the framing rules:
+- people.cp1252.dos.txt: \r\n line endings and a trailing 0x1A, as DOS tools
+  write them. Decodes to people.expected.json.
+- people.cp1252.header.txt: a header line of column names, then the records.
+  Decodes to people.expected.json when the first line is skipped.
+- people.cp1252.multi.txt.gz: two concatenated gzip members, split inside a
+  record. Decodes to people.expected.json.
+- people.cp1252.ragged.txt: the records with trailing spaces trimmed, so the
+  last one is short, plus a blank line and a line cut off inside the city
+  field. Decodes to people.ragged.expected.json.
 
 Needs 7z (p7zip) for the deflate64 zips, since Python's zipfile can't write
 them. Output is deterministic: running this again leaves git clean.
@@ -101,7 +113,7 @@ def write_schemas():
     write_json_lines(HERE / "people.schema.unknown-type.json", '{"fields": [', typo, "]}")
 
 
-def write_expected():
+def expected_records():
     records = []
     for row in ROWS:
         record = {}
@@ -110,7 +122,39 @@ def write_expected():
                 value = float(value)
             record[name] = value
         records.append(record)
-    write_json_lines(HERE / "people.expected.json", "[", records, "]")
+    return records
+
+
+def write_expected():
+    write_json_lines(HERE / "people.expected.json", "[", expected_records(), "]")
+
+
+def write_edge_cases(text):
+    """The files that cover the framing rules; see the module docstring."""
+    dos = text.replace("\n", "\r\n").encode("cp1252") + b"\x1a"
+    (HERE / "people.cp1252.dos.txt").write_bytes(dos)
+
+    header = "".join(f"{name[:width]:{align}{width}}" for name, width, align, _, _ in COLUMNS)
+    (HERE / "people.cp1252.header.txt").write_bytes(f"{header}\n{text}".encode("cp1252"))
+
+    data = text.encode("cp1252")
+    half = len(data) // 2
+    assert data[half - 1 : half + 1] != b"\n", "the split should fall inside a record"
+    multi = gzip.compress(data[:half], mtime=0) + gzip.compress(data[half:], mtime=0)
+    (HERE / "people.cp1252.multi.txt.gz").write_bytes(multi)
+    assert gzip.decompress(multi) == data
+
+    lines = [render_line(row).rstrip() for row in ROWS]
+    assert len(lines[-1]) == sum(width for _, width, *_ in COLUMNS[:-1]), "no code"
+    records = expected_records()
+    # 000006 is cut off 4 characters into the city field, leaving "Düss".
+    lines[5] = lines[5][:30]
+    records[5].update(city="Düss", born=None, amount=None, code=None)
+    lines.insert(4, "")
+    records.insert(4, dict.fromkeys(records[0]))
+    ragged = "".join(line + "\n" for line in lines)
+    (HERE / "people.cp1252.ragged.txt").write_bytes(ragged.encode("cp1252"))
+    write_json_lines(HERE / "people.ragged.expected.json", "[", records, "]")
 
 
 def write_zip(path, members, method=zipfile.ZIP_DEFLATED):
@@ -154,6 +198,7 @@ def main():
     write_schemas()
     write_expected()
     text = "".join(render_line(row) for row in ROWS)
+    write_edge_cases(text)
     for encoding in ENCODINGS:
         member = f"people.{encoding}.txt"
         data = text.encode(encoding)  # strict: fails if a character is missing
