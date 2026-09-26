@@ -1,67 +1,71 @@
+use std::sync::Arc;
+
 use arrow_array::ArrayRef;
-use arrow_array::builder::{ArrayBuilder, Float64Builder, StringBuilder};
+use arrow_array::builder::{Float64Builder, StringBuilder};
+use arrow_schema::{DataType as ArrowType, Field as ArrowField};
 
-use crate::{DataType, Encoding, Error, Position, Result};
+use crate::{DataType, Encoding, Error, Field, Position, Result, field};
 
-/// Collects one column's values into an Arrow array.
-pub(crate) enum Builder {
-    String(StringBuilder),
-    Float64(Float64Builder),
+/// The Arrow field a column is built into. Every column is nullable.
+pub(crate) fn arrow_field(field: &Field) -> ArrowField {
+    let dtype = match field.dtype {
+        DataType::String => ArrowType::Utf8,
+        DataType::Float64 => ArrowType::Float64,
+    };
+    ArrowField::new(&field.name, dtype, true)
 }
 
-impl Builder {
-    pub(crate) fn new(dtype: DataType) -> Builder {
-        match dtype {
-            DataType::String => Builder::String(StringBuilder::new()),
-            DataType::Float64 => Builder::Float64(Float64Builder::new()),
-        }
-    }
-
-    pub(crate) fn append_null(&mut self) {
-        match self {
-            Builder::String(b) => b.append_null(),
-            Builder::Float64(b) => b.append_null(),
-        }
-    }
-
-    /// Appends a trimmed, non-empty field value. `position` places a byte
-    /// offset within the value, for the error if there is one.
-    pub(crate) fn append(
-        &mut self,
-        value: &[u8],
-        encoding: Encoding,
-        scratch: &mut String,
-        position: impl Fn(usize) -> Position,
-    ) -> Result<()> {
-        match self {
-            Builder::String(b) => {
+/// Builds one field's column from a chunk's lines, each with its offset in the
+/// chunk. The field's type is matched once, then each type has its own loop.
+/// `position(line, byte)` places a bad value by the index of its line and its
+/// offset in the chunk.
+pub(crate) fn column(
+    field: &Field,
+    lines: &[(usize, &[u8])],
+    encoding: Encoding,
+    position: impl Fn(usize, usize) -> Position,
+) -> Result<ArrayRef> {
+    let values = lines.iter().enumerate().map(|(i, &(start, line))| {
+        let (at, value) = field::value(line, field.start, field.len);
+        (i, start + at, value)
+    });
+    match field.dtype {
+        DataType::String => {
+            let mut builder = StringBuilder::with_capacity(lines.len(), lines.len() * field.len);
+            let mut scratch = String::new();
+            for (i, at, value) in values {
+                if value.is_empty() {
+                    builder.append_null();
+                    continue;
+                }
                 let text =
                     encoding
-                        .decode(value, scratch)
+                        .decode(value, &mut scratch)
                         .map_err(|offset| Error::InvalidByte {
-                            position: position(offset),
+                            position: position(i, at + offset),
                             byte: value[offset],
                         })?;
-                b.append_value(text);
+                builder.append_value(text);
             }
-            Builder::Float64(b) => {
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(lines.len());
+            for (i, at, value) in values {
+                if value.is_empty() {
+                    builder.append_null();
+                    continue;
+                }
                 let number = parse_f64(value).ok_or_else(|| Error::InvalidFloat {
-                    position: position(0),
-                    value: (encoding.decode(value, scratch)).map_or_else(
+                    position: position(i, at),
+                    value: (encoding.decode(value, &mut String::new())).map_or_else(
                         |_| String::from_utf8_lossy(value).into_owned(),
                         str::to_owned,
                     ),
                 })?;
-                b.append_value(number);
+                builder.append_value(number);
             }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(&mut self) -> ArrayRef {
-        match self {
-            Builder::String(b) => ArrayBuilder::finish(b),
-            Builder::Float64(b) => ArrayBuilder::finish(b),
+            Ok(Arc::new(builder.finish()))
         }
     }
 }

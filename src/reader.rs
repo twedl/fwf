@@ -1,7 +1,5 @@
-use std::io::Read;
-
 use arrow_array::RecordBatch;
-use bytes::Bytes;
+use arrow_select::concat::concat_batches;
 
 use crate::input::{self, Input, Location};
 use crate::read_impl::Parser;
@@ -11,20 +9,15 @@ use crate::{ReadOptions, Result};
 /// stdin, bytes or a reader) into one record batch, in order.
 pub fn read(location: impl Into<Location>, options: &ReadOptions) -> Result<RecordBatch> {
     let units = input::open(location.into(), options.container, options.entries.as_ref())?;
-    let mut parser = Parser::new(options);
+    let parser = Parser::new(options);
+    let mut batches = Vec::new();
     for unit in units {
-        let bytes = match unit.input {
-            Input::Slice(bytes) => bytes,
-            // Until step 5 parses streams block by block, read them whole.
-            Input::Stream(mut reader) => {
-                let mut buf = Vec::new();
-                reader
-                    .read_to_end(&mut buf)
-                    .map_err(input::io_error(&unit.name))?;
-                Bytes::from(buf)
-            }
-        };
-        parser.parse(&unit.name, &bytes)?;
+        batches.extend(match unit.input {
+            Input::Slice(bytes) => parser.parse_slice(&unit.name, &bytes)?,
+            Input::Stream(reader) => parser.parse_stream(&unit.name, reader)?,
+        });
     }
-    Ok(parser.finish())
+    let batch = concat_batches(parser.schema(), &batches);
+    // Utf8 columns hold at most 2 GiB of text, as they did from one builder.
+    Ok(batch.expect("each column's text fits in 2 GiB"))
 }
