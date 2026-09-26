@@ -35,19 +35,22 @@ impl Builder {
     ) -> Result<()> {
         match self {
             Builder::String(b) => {
-                let text = encoding
-                    .decode(value, scratch)
-                    .map_err(|e| Error::InvalidByte {
-                        position: position(e.offset),
-                        byte: e.byte,
-                        encoding,
-                    })?;
+                let text =
+                    encoding
+                        .decode(value, scratch)
+                        .map_err(|offset| Error::InvalidByte {
+                            position: position(offset),
+                            byte: value[offset],
+                        })?;
                 b.append_value(text);
             }
             Builder::Float64(b) => {
                 let number = parse_f64(value).ok_or_else(|| Error::InvalidFloat {
                     position: position(0),
-                    value: String::from_utf8_lossy(value).into_owned(),
+                    value: (encoding.decode(value, scratch)).map_or_else(
+                        |_| String::from_utf8_lossy(value).into_owned(),
+                        str::to_owned,
+                    ),
                 })?;
                 b.append_value(number);
             }

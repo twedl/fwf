@@ -1,22 +1,12 @@
 use memchr::memchr;
 
-use crate::Encoding;
-
-const BOM: &[u8] = b"\xEF\xBB\xBF";
-
-/// A unit without what sits at its edges rather than in its records: a UTF-8
-/// BOM at the start of a UTF-8 unit, and a DOS end-of-file marker (0x1A) right
-/// after the last line ending. Returns where the records start, and their bytes.
-pub(crate) fn unit_body(bytes: &[u8], encoding: Encoding) -> (usize, &[u8]) {
-    let start = match encoding {
-        Encoding::Utf8 if bytes.starts_with(BOM) => BOM.len(),
-        _ => 0,
-    };
-    let end = match bytes {
-        [.., b'\n', 0x1A] => bytes.len() - 1,
-        _ => bytes.len(),
-    };
-    (start, &bytes[start..end])
+/// A unit without a DOS end-of-file marker (0x1A) right after its last line
+/// ending: the marker sits at the unit's edge, not in a record.
+pub(crate) fn strip_eof_marker(bytes: &[u8]) -> &[u8] {
+    match bytes {
+        [body @ .., 0x1A] if body.ends_with(b"\n") => body,
+        _ => bytes,
+    }
 }
 
 /// Splits bytes into records, yielding each line's byte offset and its bytes
@@ -61,18 +51,8 @@ mod tests {
     }
 
     #[test]
-    fn strips_a_bom_only_from_utf8() {
-        let bytes = b"\xEF\xBB\xBFab\n";
-        assert_eq!(unit_body(bytes, Encoding::Utf8), (3, &b"ab\n"[..]));
-        assert_eq!(unit_body(bytes, Encoding::Cp1252), (0, &bytes[..]));
-    }
-
-    #[test]
     fn drops_0x1a_only_after_the_last_line_ending() {
-        assert_eq!(
-            unit_body(b"ab\r\n\x1A", Encoding::Cp850),
-            (0, &b"ab\r\n"[..])
-        );
-        assert_eq!(unit_body(b"ab\x1A", Encoding::Cp850), (0, &b"ab\x1A"[..]));
+        assert_eq!(strip_eof_marker(b"ab\r\n\x1A"), b"ab\r\n");
+        assert_eq!(strip_eof_marker(b"ab\x1A"), b"ab\x1A");
     }
 }

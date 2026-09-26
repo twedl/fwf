@@ -1,4 +1,6 @@
-//! Read fixed-width files into Arrow record batches.
+//! Read cp1252 and cp850 fixed-width files into Arrow record batches.
+//!
+//! For UTF-8 files, use polars directly.
 
 mod builder;
 mod encoding;

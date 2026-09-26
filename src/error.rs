@@ -1,7 +1,5 @@
 use std::fmt;
 
-use crate::Encoding;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -21,12 +19,8 @@ pub enum Error {
         unit: String,
         source: std::io::Error,
     },
-    /// A byte isn't valid in the file's encoding.
-    InvalidByte {
-        position: Position,
-        byte: u8,
-        encoding: Encoding,
-    },
+    /// A byte cp1252 leaves undefined. (cp850 defines all 256.)
+    InvalidByte { position: Position, byte: u8 },
     /// A `Float64` field doesn't hold a number.
     InvalidFloat { position: Position, value: String },
 }
@@ -71,17 +65,11 @@ impl fmt::Display for Error {
             Error::ZeroLength { field } => write!(f, "field {field:?}: length is 0"),
             Error::DuplicateName { field } => write!(f, "field {field:?} appears more than once"),
             Error::Io { unit, source } => write!(f, "{unit}: {source}"),
-            Error::InvalidByte {
-                position,
-                byte,
-                encoding,
-            } => {
-                write!(f, "{position}: byte 0x{byte:02X} is not valid {encoding}")?;
-                if *encoding == Encoding::Utf8 {
-                    write!(f, "; is the file cp1252 or cp850?")?;
-                }
-                Ok(())
-            }
+            // cp1252's undefined bytes are common letters in cp850 (ü, ì, Å, É, Ø).
+            Error::InvalidByte { position, byte } => write!(
+                f,
+                "{position}: byte 0x{byte:02X} is not valid cp1252; is the file cp850?"
+            ),
             Error::InvalidFloat { position, value } => {
                 write!(f, "{position}: {value:?} is not a Float64")
             }

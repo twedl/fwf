@@ -10,8 +10,9 @@ fn fixture(name: &str) -> PathBuf {
         .collect()
 }
 
-fn people_schema() -> Schema {
-    Schema::from_json(&std::fs::read(fixture("people.schema.json")).unwrap()).unwrap()
+fn people(encoding: Encoding) -> ReadOptions {
+    let json = std::fs::read(fixture("people.schema.json")).unwrap();
+    ReadOptions::new(Schema::from_json(&json).unwrap(), encoding)
 }
 
 /// The batch as JSON rows, the shape of people.expected.json.
@@ -39,21 +40,18 @@ fn every_encoding_reads_to_the_expected_records() {
     let expected: Value =
         serde_json::from_slice(&std::fs::read(fixture("people.expected.json")).unwrap()).unwrap();
     for (file, encoding) in [
-        ("people.utf-8.txt", Encoding::Utf8),
         ("people.cp1252.txt", Encoding::Cp1252),
         ("people.cp850.txt", Encoding::Cp850),
     ] {
-        let options = ReadOptions::new(people_schema()).with_encoding(encoding);
-        let batch = fwf::read(fixture(file), &options).unwrap();
+        let batch = fwf::read(fixture(file), &people(encoding)).unwrap();
         assert_eq!(rows(&batch), expected, "{file}");
     }
 }
 
 #[test]
-fn the_wrong_encoding_names_the_bad_byte() {
-    // cp850 writes é as 0x82, which isn't valid UTF-8.
-    let options = ReadOptions::new(people_schema());
-    let err = fwf::read(fixture("people.cp850.txt"), &options).unwrap_err();
+fn cp850_read_as_cp1252_names_the_bad_byte() {
+    // cp850 writes the ü in "Zoë Müller" as 0x81, which cp1252 leaves undefined.
+    let err = fwf::read(fixture("people.cp850.txt"), &people(Encoding::Cp1252)).unwrap_err();
     let Error::InvalidByte { position, byte, .. } = &err else {
         panic!("{err:?}")
     };
@@ -64,13 +62,16 @@ fn the_wrong_encoding_names_the_bad_byte() {
             position.byte,
             *byte
         ),
-        (1, "name", 9, 0x82)
+        (2, "name", 73, 0x81)
+    );
+    assert!(
+        err.to_string()
+            .ends_with("is not valid cp1252; is the file cp850?")
     );
 }
 
 #[test]
 fn a_missing_file_is_an_io_error() {
-    let options = ReadOptions::new(people_schema());
-    let err = fwf::read(fixture("no-such-file.txt"), &options).unwrap_err();
+    let err = fwf::read(fixture("no-such-file.txt"), &people(Encoding::Cp1252)).unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "{err:?}");
 }

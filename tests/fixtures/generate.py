@@ -2,11 +2,10 @@
 """Generate the FWF test fixtures in this directory.
 
 One set of records (ROWS) is written in every combination of encoding
-(utf-8, cp1252, cp850) and container (plain .txt, .txt.gz, deflate .zip,
+(cp1252, cp850) and container (plain .txt, .txt.gz, deflate .zip,
 deflate64 .zip). Stdin tests pipe or redirect these same files.
 
-Widths count characters. In cp1252 and cp850 that is also bytes; in UTF-8 a
-line with accents is longer in bytes than in characters.
+Both encodings use one byte per character, so widths are bytes.
 
 Every data file decodes to the records in people.expected.json, where a
 blank field is null, using the schema in people.schema.json. Each schema
@@ -32,7 +31,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-ENCODINGS = ["utf-8", "cp1252", "cp850"]
+ENCODINGS = ["cp1252", "cp850"]
 
 # (name, width, alignment, type, description): "<" pads on the right, ">" on
 # the left. A type of None leaves "type" out of the schema.

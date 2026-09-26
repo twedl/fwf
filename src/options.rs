@@ -8,16 +8,9 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    /// Reads records laid out by `schema`, as UTF-8 unless told otherwise.
-    pub fn new(schema: Schema) -> ReadOptions {
-        ReadOptions {
-            schema,
-            encoding: Encoding::Utf8,
-        }
-    }
-
-    pub fn with_encoding(mut self, encoding: Encoding) -> ReadOptions {
-        self.encoding = encoding;
-        self
+    /// Reads records laid out by `schema`. There is no default encoding: cp1252
+    /// and cp850 both decode almost any byte, so a wrong guess would be silent.
+    pub fn new(schema: Schema, encoding: Encoding) -> ReadOptions {
+        ReadOptions { schema, encoding }
     }
 }
