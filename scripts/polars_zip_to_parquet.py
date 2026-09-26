@@ -45,7 +45,7 @@ def column(field):
         .str.slice(field["position"] - 1, field["length"])
         .str.strip_chars(ASCII_WHITESPACE)
     )
-    value = pl.when(value == "").then(None).otherwise(value)
+    value = pl.when(value != "").then(value)
     return value.cast(TYPES[field.get("type", "String")]).alias(field["name"])
 
 
