@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use flate2::bufread::MultiGzDecoder;
-use globset::GlobSet;
 
 use crate::{Error, Result};
 
@@ -58,13 +57,9 @@ pub(crate) enum Input {
     Stream(Box<dyn Read + Send>),
 }
 
-/// Opens a location as the units it holds, in order. Without `entries`, a zip
-/// must hold exactly one file; with them, every file whose name matches is read.
-pub(crate) fn open(
-    location: Location,
-    container: Container,
-    entries: Option<&GlobSet>,
-) -> Result<Vec<Unit>> {
+/// Opens a location as the one unit it holds. Without an `entry`, a zip must
+/// hold exactly one file; with one, the file of that name is read.
+pub(crate) fn open(location: Location, container: Container, entry: Option<&str>) -> Result<Unit> {
     let (name, input) = match location {
         Location::Path(path) => {
             let name = path.display().to_string();
@@ -84,7 +79,7 @@ pub(crate) fn open(
             Input::Slice(bytes) => bytes,
             Input::Stream(reader) => spool(reader).map_err(io_error(&name))?,
         };
-        return zip::members(&name, bytes, entries);
+        return zip::member(&name, bytes, entry);
     }
     let input = match (container, input) {
         (Container::Gzip, Input::Slice(bytes)) => {
@@ -95,7 +90,7 @@ pub(crate) fn open(
         }
         (_, input) => input,
     };
-    Ok(vec![Unit { name, input }])
+    Ok(Unit { name, input })
 }
 
 pub(crate) fn io_error(unit: &str) -> impl FnOnce(io::Error) -> Error + '_ {

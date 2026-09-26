@@ -14,11 +14,11 @@ pub enum Error {
     ZeroLength { field: String },
     /// Two fields have the same name.
     DuplicateName { field: String },
-    /// An entry pattern isn't a valid glob.
-    InvalidEntryPattern { pattern: String, message: String },
-    /// A zip archive can't be used: its index is unreadable, a member is
-    /// encrypted or uses another compression method, or the entries don't pick
-    /// the files to read. Data that fails its CRC-32 is an `Io` error.
+    /// A selected column isn't in the schema.
+    UnknownColumn { name: String },
+    /// A zip archive can't be used: its index is unreadable, the member is
+    /// encrypted or uses another compression method, or the entry doesn't pick
+    /// one file to read. Data that fails its CRC-32 is an `Io` error.
     Archive { unit: String, message: String },
     /// The input couldn't be read.
     Io {
@@ -29,6 +29,9 @@ pub enum Error {
     InvalidByte { position: Position, byte: u8 },
     /// A `Float64` field doesn't hold a number.
     InvalidFloat { position: Position, value: String },
+    /// A `String` column holds more than the 2 GiB of text one record batch
+    /// can, so `read()` can't join it; `scan()` reads it in smaller batches.
+    TooLarge,
 }
 
 /// Where in the input a value failed to read.
@@ -70,9 +73,7 @@ impl fmt::Display for Error {
             ),
             Error::ZeroLength { field } => write!(f, "field {field:?}: length is 0"),
             Error::DuplicateName { field } => write!(f, "field {field:?} appears more than once"),
-            Error::InvalidEntryPattern { pattern, message } => {
-                write!(f, "invalid entry pattern {pattern:?}: {message}")
-            }
+            Error::UnknownColumn { name } => write!(f, "column {name:?} isn't in the schema"),
             Error::Archive { unit, message } => write!(f, "{unit}: {message}"),
             Error::Io { unit, source } => write!(f, "{unit}: {source}"),
             // cp1252's undefined bytes are common letters in cp850 (ü, ì, Å, É, Ø).
@@ -83,6 +84,11 @@ impl fmt::Display for Error {
             Error::InvalidFloat { position, value } => {
                 write!(f, "{position}: {value:?} is not a Float64")
             }
+            Error::TooLarge => write!(
+                f,
+                "a String column holds more than 2 GiB of text, too much for one record \
+                 batch; read it in batches with scan()"
+            ),
         }
     }
 }

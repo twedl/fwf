@@ -18,5 +18,5 @@ pub use encoding::Encoding;
 pub use error::{Error, Position, Result};
 pub use input::{Container, Location};
 pub use options::ReadOptions;
-pub use reader::read;
+pub use reader::{read, scan};
 pub use schema::{DataType, Field, Schema};

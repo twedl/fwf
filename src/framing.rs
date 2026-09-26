@@ -29,6 +29,12 @@ pub(crate) fn lines(bytes: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
     })
 }
 
+/// Where the first `n` lines of `bytes` end, with their line endings; all of
+/// `bytes` if it has fewer.
+pub(crate) fn after_lines(bytes: &[u8], n: usize) -> usize {
+    lines(bytes).nth(n).map_or(bytes.len(), |(start, _)| start)
+}
+
 /// Where the last line ending in `bytes` ends: the length of its whole lines.
 pub(crate) fn last_line_end(bytes: &[u8]) -> Option<usize> {
     memrchr(b'\n', bytes).map(|i| i + 1)
@@ -85,6 +91,15 @@ mod tests {
         assert_eq!(strip_eof_marker(b"ab\x1A", false), b"ab\x1A");
         assert_eq!(strip_eof_marker(b"\x1A", false), b"\x1A");
         assert_eq!(strip_eof_marker(b"\x1A", true), b"");
+    }
+
+    #[test]
+    fn finds_where_the_first_lines_end() {
+        assert_eq!(after_lines(b"ab\r\ncd\nef", 0), 0);
+        assert_eq!(after_lines(b"ab\r\ncd\nef", 1), 4);
+        assert_eq!(after_lines(b"ab\r\ncd\nef", 2), 7);
+        assert_eq!(after_lines(b"ab\r\ncd\nef", 3), 9);
+        assert_eq!(after_lines(b"ab\n", 5), 3);
     }
 
     #[test]

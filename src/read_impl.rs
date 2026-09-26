@@ -1,32 +1,41 @@
 use std::io::Read;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use bytes::Bytes;
 use rayon::prelude::*;
 
-use crate::{Position, ReadOptions, Result, builder, framing, input};
+use crate::input::{Input, Unit};
+use crate::{Field, Position, ReadOptions, Result, builder, framing, input};
 
-/// About 1 MiB, inside the 1–4 MB range where filling a column at a time
-/// measured fastest: small enough that a chunk's lines and columns stay in
-/// cache.
-const CHUNK_SIZE: usize = 1 << 20;
+/// How many chunks of an in-memory unit each thread parses at a time: enough
+/// to even out uneven chunks, few enough that the batches waiting to be read
+/// stay few.
+const CHUNKS_PER_THREAD: usize = 4;
 
-/// Parses units into record batches, one per chunk. Each chunk is filled a
-/// column at a time.
-pub(crate) struct Parser<'a> {
-    options: &'a ReadOptions,
+/// Parses a unit into record batches, one per chunk, as they're asked for.
+/// Each chunk is filled a column at a time.
+pub(crate) struct Parser {
+    options: ReadOptions,
+    /// The chosen fields, in output order.
+    fields: Vec<Field>,
     schema: SchemaRef,
-    chunk_size: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub(crate) fn new(options: &'a ReadOptions) -> Parser<'a> {
-        let fields = options.schema.fields().iter().map(builder::arrow_field);
+impl Parser {
+    pub(crate) fn new(options: &ReadOptions) -> Parser {
+        let all = options.schema.fields();
+        let fields: Vec<Field> = match &options.columns {
+            Some(columns) => columns.iter().map(|&i| all[i].clone()).collect(),
+            None => all.to_vec(),
+        };
+        let schema = ArrowSchema::new(fields.iter().map(builder::arrow_field).collect::<Vec<_>>());
         Parser {
-            options,
-            schema: Arc::new(ArrowSchema::new(fields.collect::<Vec<_>>())),
-            chunk_size: CHUNK_SIZE,
+            options: options.clone(),
+            fields,
+            schema: Arc::new(schema),
         }
     }
 
@@ -34,59 +43,114 @@ impl<'a> Parser<'a> {
         &self.schema
     }
 
-    /// Parses an in-memory unit's chunks in parallel, in order. If several
-    /// chunks fail, the error is the one that comes first in the unit.
-    pub(crate) fn parse_slice(&self, unit: &str, bytes: &[u8]) -> Result<Vec<RecordBatch>> {
-        let bytes = framing::strip_eof_marker(bytes, false);
-        let chunks: Vec<_> = framing::chunks(bytes, self.chunk_size).collect();
-        let batches: Vec<Result<RecordBatch>> = (chunks.into_par_iter())
-            // Each worker reuses one line index from chunk to chunk.
-            .map_init(Vec::new, |lines, chunk| {
-                lines.clear();
-                lines.extend(framing::lines(&bytes[chunk.clone()]));
-                let records_before = || framing::lines(&bytes[..chunk.start]).count();
-                self.parse_chunk(unit, lines, chunk.start, records_before)
-            })
+    /// The unit's batches in order, each parsed when it's asked for. Nothing
+    /// more is parsed after an error.
+    pub(crate) fn batches(self, unit: Unit) -> impl Iterator<Item = Result<RecordBatch>> + Send {
+        let mut batches: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = match unit.input {
+            Input::Slice(bytes) => Box::new(self.parse_slice(unit.name, bytes)),
+            Input::Stream(reader) => Box::new(self.parse_stream(unit.name, reader)),
+        };
+        let mut failed = false;
+        std::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            let batch = batches.next()?;
+            failed = batch.is_err();
+            Some(batch)
+        })
+    }
+
+    /// Parses an in-memory unit's chunks in parallel, a few per thread at a
+    /// time, in order.
+    fn parse_slice(self, unit: String, bytes: Bytes) -> impl Iterator<Item = Result<RecordBatch>> {
+        let body = framing::strip_eof_marker(&bytes, false);
+        let start = framing::after_lines(body, self.options.skip_rows);
+        let end = match self.options.n_rows {
+            Some(n) => start + framing::after_lines(&body[start..], n),
+            None => body.len(),
+        };
+        let chunks: Vec<_> = framing::chunks(&body[start..end], self.options.chunk_size)
+            .map(|chunk| start + chunk.start..start + chunk.end)
             .collect();
-        batches.into_iter().collect()
+        let threads = self.install(rayon::current_num_threads);
+        let waves: Vec<_> = chunks
+            .chunks(threads * CHUNKS_PER_THREAD)
+            .map(<[_]>::to_vec)
+            .collect();
+        waves
+            .into_iter()
+            .flat_map(move |wave| self.parse_wave(&unit, &bytes, wave))
+    }
+
+    /// Parses chunks of an in-memory unit in parallel, keeping their order.
+    fn parse_wave(
+        &self,
+        unit: &str,
+        bytes: &[u8],
+        chunks: Vec<Range<usize>>,
+    ) -> Vec<Result<RecordBatch>> {
+        self.install(|| {
+            (chunks.into_par_iter())
+                // Each worker reuses one line index from chunk to chunk.
+                .map_init(Vec::new, |lines, chunk| {
+                    lines.clear();
+                    lines.extend(framing::lines(&bytes[chunk.clone()]));
+                    // Skipped lines count too, so records are the unit's lines.
+                    let records_before = || framing::lines(&bytes[..chunk.start]).count();
+                    self.parse_chunk(unit, lines, chunk.start, records_before)
+                })
+                .collect()
+        })
     }
 
     /// Parses a streamed unit a block at a time: each block is cut after its
     /// last line ending, and the rest is carried into the next.
-    pub(crate) fn parse_stream(
-        &self,
-        unit: &str,
-        mut reader: impl Read,
-    ) -> Result<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
+    fn parse_stream(
+        self,
+        unit: String,
+        mut reader: Box<dyn Read + Send>,
+    ) -> impl Iterator<Item = Result<RecordBatch>> {
+        let size = self.options.chunk_size;
         let mut buf = Vec::new();
         let mut offset = 0;
-        loop {
-            let read = (&mut reader)
-                .take(self.chunk_size as u64)
-                .read_to_end(&mut buf)
-                .map_err(input::io_error(unit))?;
-            let at_end = read < self.chunk_size;
-            let end = match framing::last_line_end(&buf) {
-                _ if at_end => buf.len(),
-                Some(end) => end,
-                // A line longer than a block: read more of it.
-                None => continue,
-            };
-            // Every block after the first follows the line ending it was cut at.
-            let block = framing::strip_eof_marker(&buf[..end], offset > 0);
-            if !block.is_empty() {
-                let lines: Vec<_> = framing::lines(block).collect();
-                let records_before = || batches.iter().map(RecordBatch::num_rows).sum();
-                let batch = self.parse_chunk(unit, &lines, offset, records_before)?;
-                batches.push(batch);
+        // The unit's lines so far, skipped ones included.
+        let mut records = 0;
+        let mut rows_left = self.options.n_rows.unwrap_or(usize::MAX);
+        let mut at_end = false;
+        std::iter::from_fn(move || {
+            while !at_end && rows_left > 0 {
+                let read = (&mut reader).take(size as u64).read_to_end(&mut buf);
+                let read = match read {
+                    Ok(read) => read,
+                    Err(e) => return Some(Err(input::io_error(&unit)(e))),
+                };
+                at_end = read < size;
+                let end = match framing::last_line_end(&buf) {
+                    _ if at_end => buf.len(),
+                    Some(end) => end,
+                    // A line longer than a block: read more of it.
+                    None => continue,
+                };
+                // Every block after the first follows the line ending it was cut at.
+                let block = framing::strip_eof_marker(&buf[..end], offset > 0);
+                let mut lines: Vec<_> = framing::lines(block).collect();
+                let skip = (self.options.skip_rows.saturating_sub(records)).min(lines.len());
+                lines.drain(..skip);
+                lines.truncate(rows_left);
+                let records_before = records + skip;
+                records = records_before + lines.len();
+                rows_left -= lines.len();
+                let batch = (!lines.is_empty())
+                    .then(|| self.parse_chunk(&unit, &lines, offset, || records_before));
+                offset += end;
+                buf.drain(..end);
+                if batch.is_some() {
+                    return batch;
+                }
             }
-            if at_end {
-                return Ok(batches);
-            }
-            offset += end;
-            buf.drain(..end);
-        }
+            None
+        })
     }
 
     /// Parses a chunk's lines, each with its offset in the chunk, a column at a
@@ -99,13 +163,14 @@ impl<'a> Parser<'a> {
         offset: usize,
         records_before: impl Fn() -> usize,
     ) -> Result<RecordBatch> {
-        let fields = self.options.schema.fields();
-        let columns = fields.iter().map(|field| {
-            builder::column(field, lines, self.options.encoding, |line, byte| Position {
-                unit: unit.to_owned(),
-                record: records_before() + line + 1,
-                field: field.name.clone(),
-                byte: offset + byte,
+        let columns = self.fields.iter().map(|field| {
+            builder::column(field, lines, self.options.encoding, &|line, byte| {
+                Position {
+                    unit: unit.to_owned(),
+                    record: records_before() + line + 1,
+                    field: field.name.clone(),
+                    byte: offset + byte,
+                }
             })
         });
         let columns = columns.collect::<Result<Vec<_>>>()?;
@@ -113,6 +178,14 @@ impl<'a> Parser<'a> {
         let batch_options = RecordBatchOptions::new().with_row_count(Some(lines.len()));
         let batch = RecordBatch::try_new_with_options(self.schema.clone(), columns, &batch_options);
         Ok(batch.expect("each column is built as its field's type"))
+    }
+
+    /// Runs `op` on the options' thread pool, or else rayon's global one.
+    fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        match &self.options.pool {
+            Some(pool) => pool.install(op),
+            None => op(),
+        }
     }
 }
 
@@ -137,6 +210,25 @@ mod tests {
         ReadOptions::new(Schema::from_json(json).unwrap(), Encoding::Cp1252)
     }
 
+    /// Parses bytes as one slice or one stream, in chunks of `chunk_size`.
+    fn batches(
+        options: &ReadOptions,
+        bytes: &[u8],
+        chunk_size: usize,
+        stream: bool,
+    ) -> impl Iterator<Item = Result<RecordBatch>> {
+        let input = if stream {
+            Input::Stream(Box::new(Cursor::new(bytes.to_vec())))
+        } else {
+            Input::Slice(Bytes::copy_from_slice(bytes))
+        };
+        let unit = Unit {
+            name: "test.txt".to_owned(),
+            input,
+        };
+        Parser::new(&options.clone().with_chunk_size(chunk_size)).batches(unit)
+    }
+
     /// Reads bytes as one slice or one stream, in chunks of `chunk_size`.
     fn read(
         options: &ReadOptions,
@@ -144,16 +236,9 @@ mod tests {
         chunk_size: usize,
         stream: bool,
     ) -> Result<RecordBatch> {
-        let parser = Parser {
-            chunk_size,
-            ..Parser::new(options)
-        };
-        let batches = if stream {
-            parser.parse_stream("test.txt", Cursor::new(bytes))?
-        } else {
-            parser.parse_slice("test.txt", bytes)?
-        };
-        Ok(concat_batches(parser.schema(), &batches).unwrap())
+        let schema = Parser::new(options).schema().clone();
+        let batches = batches(options, bytes, chunk_size, stream).collect::<Result<Vec<_>>>()?;
+        Ok(concat_batches(&schema, &batches).unwrap())
     }
 
     #[test]
@@ -219,6 +304,62 @@ mod tests {
         for stream in [false, true] {
             let batch = read(&options, b"", 1, stream).unwrap();
             assert_eq!(batch.num_rows(), 0);
+        }
+    }
+
+    #[test]
+    fn skipped_lines_are_not_parsed_but_are_counted() {
+        let options = options(AMOUNTS.as_bytes()).with_skip_rows(2);
+        let bytes = b"name amount\n---- ------\nab     1.5\ncd    1,50\n";
+        for size in [1, 11, 100] {
+            for stream in [false, true] {
+                let err = read(&options, bytes, size, stream).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    r#"test.txt: record 4, field "amount" (byte 41): "1,50" is not a Float64"#,
+                    "chunk size {size}, stream {stream}"
+                );
+                let rows = read(&options, &bytes[..35], size, stream)
+                    .unwrap()
+                    .num_rows();
+                assert_eq!(rows, 1, "chunk size {size}, stream {stream}");
+                let rows = read(&options, b"a\n", size, stream).unwrap().num_rows();
+                assert_eq!(rows, 0, "chunk size {size}, stream {stream}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_past_n_rows_is_parsed() {
+        let bytes = b"ab     1.5\ncd     2.5\nef    1,50\n";
+        for size in [1, 11, 100] {
+            for stream in [false, true] {
+                let rows = |options: ReadOptions| {
+                    let batch = read(&options, bytes, size, stream);
+                    batch.unwrap().num_rows()
+                };
+                let options = options(AMOUNTS.as_bytes());
+                assert_eq!(rows(options.clone().with_n_rows(0)), 0);
+                assert_eq!(rows(options.clone().with_n_rows(2)), 2);
+                assert_eq!(rows(options.with_skip_rows(1).with_n_rows(1)), 1);
+            }
+        }
+        let options = options(SCHEMA).with_n_rows(100);
+        assert_eq!(read(&options, PEOPLE, 7, true).unwrap().num_rows(), 8);
+        assert_eq!(read(&options, PEOPLE, 7, false).unwrap().num_rows(), 8);
+    }
+
+    #[test]
+    fn batches_before_an_error_come_first_and_none_after() {
+        // One chunk per line, more lines than one wave holds.
+        let mut bytes = b"ab     1.5\n".repeat(1000);
+        bytes.extend(b"cd    1,50\nef     2.5\n");
+        for stream in [false, true] {
+            let results: Vec<_> =
+                batches(&options(AMOUNTS.as_bytes()), &bytes, 1, stream).collect();
+            assert_eq!(results.len(), 1001, "stream {stream}");
+            assert!(results[..1000].iter().all(Result::is_ok), "stream {stream}");
+            assert!(results[1000].is_err(), "stream {stream}");
         }
     }
 }

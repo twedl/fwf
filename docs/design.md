@@ -27,10 +27,15 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Scope order | Decided | Input surface first; outputs later. | Keeps the first slice small. |
 | Architecture | Agreed | Shared core + columnar reader, laid out like polars-io's `csv/read`. | See Core architecture and Crate layout. |
 | Row reader | Dropped | No csv-crate-style row reader (serde, `ByteRecord`) or writer. | Nothing on the path to Arrow and Parquet needs it; add it only if something does. |
-| Input model | Agreed | Every input resolves to units of `Slice` or `Stream`. | See Input surface. |
+| Input model | Agreed | Every input resolves to one unit, a `Slice` or a `Stream`. | See Input surface. |
+| Several units | Decided | For now, one unit per read: a zip must hold exactly one file, or the entry names the one to read. | Chosen on 2026-09-26, instead of one output (with or without a source-name column) or one per unit. |
+| Zip entry | Decided | The entry is a member's exact name, not a glob. | Chosen on 2026-09-26. Drops the `globset` dependency. |
 | Parsing order | Decided | Chunks of about 1 MiB are filled a column at a time, in parallel. | Measured 26% faster on 6 fields × 61 characters and 43–44% on 40 fields × 200 characters; see Parsing order. |
 | Benchmark | Dropped | The records-vs-columns benchmark and the record-at-a-time parser are not kept in the repo. | Dropped on 2026-09-26. The measurements under Parsing order stand as the record of the choice. |
-| Joining chunks | Agreed | Each chunk becomes a `RecordBatch`; `read()` joins them in order with `arrow-select`'s `concat_batches`. | The same batches are what `scan()` will yield. |
+| Joining chunks | Agreed | Each chunk becomes a `RecordBatch`; `read()` joins them in order with `arrow-select`'s `concat_batches`. | The same batches are what `scan()` yields. |
+| String size | Decided | `String` columns stay Arrow `Utf8`. Past 2 GiB of text in one column, `read()` returns `Error::TooLarge`, which points to `scan()`. | Chosen on 2026-09-26. `scan()`'s batches are one chunk each, far below the cap at the default 1 MiB chunk size. |
+| Scan | Agreed | `scan()` returns `Box<dyn RecordBatchReader + Send>`. Opening errors come from `scan()`; parsing errors come from the reader as `ArrowError::ExternalError` holding an `fwf::Error`, and nothing is read after one. `read()` collects the same batches. | Arrow's reader trait is what arrow-csv, parquet and the Arrow C Stream interface take. |
+| Lazy parsing | Agreed | An in-memory unit is parsed 4 chunks per thread at a time, when the batches are asked for. | Bounds `scan()`'s memory (about 32 MiB of input on 8 threads) for about 5% on `read()`; see Parsing order. |
 | Parallel errors | Agreed | If several chunks fail, the error reported is the first in the unit. | Errors stay the same from run to run, whichever thread finds one first. |
 
 ## Core architecture
@@ -42,7 +47,7 @@ In FWF the layout gives field boundaries before any byte is read; only record bo
   - Framing: a record ends at `\n`, and a `\r` before it is dropped. Chunks are cut after a `\n`.
   - `field::value(line, start, len)` returns a field's trimmed bytes and where they start; an empty value is null, and a short line leaves later fields empty.
   - Byte-level parsers for declared types, one specialized loop per column. v1 has only `Float64`; integers, dates and decimals can come later.
-- **Columnar reader** (polars shape): split each in-memory unit into chunks of about 1 MiB and parse them in parallel (rayon); read streamed units a block of the same size at a time. Each chunk becomes one Arrow `RecordBatch`, and `read()` joins them in order. Within a chunk, one pass indexes the lines, then each column is filled in its own loop: its type is chosen once and its builder stays in cache. Polars goes a record at a time instead.
+- **Columnar reader** (polars shape): split each in-memory unit into chunks of about 1 MiB and parse them in parallel (rayon), a few per thread at a time; read streamed units a block of the same size at a time. Each chunk becomes one Arrow `RecordBatch`; `scan()` yields them as they're parsed, and `read()` joins them in order. Within a chunk, one pass indexes the lines, then each column is filled in its own loop: its type is chosen once and its builder stays in cache. Polars goes a record at a time instead.
 
 There is no csv-crate-style row reader. Ship one crate with cargo features; split out a core crate only if something needs it on its own.
 
@@ -63,6 +68,8 @@ Columns win because each column's type is chosen once and its builder stays in c
 
 After step 5, on a generated file of 40 fields (24 String, 16 Float64) × 200 characters, 1.5M records (301 MB), with a fifth of the String values non-ASCII (Apple M1 with 8 cores, best of 5): `read()` took 1,167 ms before step 5, 888 ms on one thread and 208 ms on all eight. The same file gzipped took 1,963 ms before and 1,724 ms after, on any number of threads, because its blocks are decompressed and parsed one after another. Joining the chunks took about 30 ms of that.
 
+After step 6, on a regenerated file of the same shape (301.5 MB, the same M1, best of 7, all eight threads): `read()` took 162–167 ms before step 6 and 173–176 ms after, and draining `scan()` took 145–151 ms. The extra time in `read()` comes from parsing 4 chunks per thread at a time: in one comparison, 2 per thread took 180–187 ms, 4 took 173–177, 8 took 172–178, 16 took 170–173, and the whole unit at once took 166–170. On one thread `read()` took 691 ms before and 700–711 after; the gzip file took 1,444 ms before and 1,374 after. Peak memory was 1,023 MB for `read()` and 384 MB for `scan()`, most of it the mapped file. `builder::column` takes its error-position closure as `&dyn Fn`. With the generic closure it had before, the step 6 parser stopped getting Arrow's `append_value` inlined into the column loops and parsed 10% slower. Why the inlining changed wasn't found: HEAD also compiled two copies of the loops.
+
 ## Crate layout
 
 One library crate, organized like polars-io's `csv/read` module. The command-line tool comes later, with the output work. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
@@ -72,9 +79,9 @@ src/
   lib.rs          re-exports; read() and scan()
   error.rs        Error + Position { unit, record, byte, field }
   schema.rs       JSON → Schema { fields }, DataType { String, Float64 }; unknown type = error
-  options.rs      ReadOptions: schema, encoding, container, entries; later columns, skip_rows,
-                  n_rows, n_threads, chunk_size. A separate ParseOptions waits until trim, null
-                  or short-line behaviour becomes configurable.
+  options.rs      ReadOptions: schema, encoding, container, entry, columns, skip_rows, n_rows,
+                  chunk_size, n_threads. A separate ParseOptions waits until trim, null or
+                  short-line behaviour becomes configurable.
   input/
     mod.rs        Location, Container, Unit, Input { Slice, Stream }, open(); sniffing the first
                   bytes; mapping files; stdin (redirect → map, pipe → stream); zip on a pipe →
@@ -85,10 +92,11 @@ src/
   framing.rs      per unit: trailing 0x1A, \n vs \r\n, line starts (memchr), chunk boundaries
   field.rs        one field's trimmed value on a line, and where it starts
   builder.rs      column builders → Arrow arrays (String → Utf8, Float64 → Float64, all nullable)
-  read_impl.rs    Parser: in-memory units split into chunks parsed in parallel, streams read a
-                  block at a time; each chunk filled a column at a time into one RecordBatch
-  reader.rs       read(location) → one RecordBatch for all units (concat_batches); later
-                  scan() → RecordBatchReader
+  read_impl.rs    Parser: in-memory units split into chunks parsed in parallel, a few per thread
+                  at a time; streams read a block at a time; each chunk filled a column at a
+                  time into one RecordBatch, when it's asked for
+  reader.rs       read(location) → one RecordBatch (concat_batches); scan(location) →
+                  RecordBatchReader
 tests/
   fixtures/…
   read.rs         every fixture with people.schema.json == people.expected.json
@@ -109,23 +117,20 @@ scripts/
 | `CsvEncoding { Utf8, LossyUtf8 }` | `encoding.rs` | The opposite set: cp1252 and cp850, no UTF-8. |
 | polars-stream `io_sources/csv/` | stream path in `read_impl.rs` | Same split between reading line batches and parsing them, without a query engine. |
 
-**Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an iterator of `RecordBatch`es, with column selection and `n_rows` as plain options, and `read()` collects it. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
+**Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an Arrow `RecordBatchReader`, with column selection and `n_rows` as plain options, and `read()` collects the same batches. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel, a few per thread at a time as the reader asks; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
 
-**Dependencies:** `arrow-array`, `arrow-schema` and `arrow-select` (not the full `arrow` crate), `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `globset`, `tempfile`, `serde`, `serde_json` and `rayon`.
+**Dependencies:** `arrow-array`, `arrow-schema` and `arrow-select` (not the full `arrow` crate), `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`.
 
-**Build order**, each step checked against the fixtures. Steps 1–5 are done (as of 2026-09-26); 6 onward is the plan.
+**Build order**, each step checked against the fixtures. Steps 1–6 are done (as of 2026-09-26); 7 onward is the plan.
 
 1. Done. `schema.rs`: load `people.schema.json`; reject `people.schema.unknown-type.json`.
 2. Done. `encoding.rs` + `tables.rs`: tables checked against Python.
 3. Done. `framing.rs`, `field.rs`, `builder.rs`, `read_impl.rs`, single-threaded, on plain `.txt`: both `people.*.txt` decode to `people.expected.json`.
 4. Done. `input/`: gzip, zip (stored, deflate and deflate64), stdin (pipe and redirect), bytes and readers.
 5. Done. Chunked, parallel, column-at-a-time parsing: in-memory units in chunks of about 1 MiB cut after a line ending, streams a block at a time with the rest of the last line carried over, and error positions kept exact across chunks. Unit tests parse the fixtures with chunks as small as one byte.
-6. **`scan()` and read options.**
-    - `scan(location, &options)` returns an Arrow `RecordBatchReader` yielding one batch per chunk; `read()` collects it. Streams already read a block at a time, but `read()` holds every batch until the end; `scan()` bounds memory on the output side too.
-    - Add `ReadOptions` for column selection, `n_rows`, `skip_rows` / header lines (applied per unit) and chunk size / thread count.
-    - Decide the open question on several units: one output (maybe with a source-name column) or one per unit.
+6. Done. `scan(location, &options)` returns an Arrow `RecordBatchReader` yielding one batch per chunk, parsed as it's asked for; `read()` collects the same batches. `ReadOptions` gained `with_columns`, `with_skip_rows`, `with_n_rows`, `with_chunk_size` and `with_n_threads`. Each read takes one unit: `with_entry` names a zip member exactly, replacing `with_entries` globs. Past 2 GiB of text in a column, `read()` returns `Error::TooLarge` instead of panicking.
 7. **Outputs.** CSV (`arrow-csv`) and Parquet (`parquet::arrow::ArrowWriter`) to a file or stdout, per Output surface: temp file + rename for files, `BufWriter` and quiet `BrokenPipe` handling for stdout, no binary output to a terminal without `--force`.
-8. **Command line.** `fwf convert [INPUT ...] --layout schema.json --encoding cp1252|cp850 [--input-format] [--entry GLOB] [-o OUTPUT] [--format csv|parquet]`, stdin and stdout by default, progress and errors on stderr. Behind a cargo feature so library users don't compile `clap`.
+8. **Command line.** `fwf convert [INPUT] --layout schema.json --encoding cp1252|cp850 [--input-format] [--entry NAME] [-o OUTPUT] [--format csv|parquet]`, stdin and stdout by default, progress and errors on stderr. Behind a cargo feature so library users don't compile `clap`.
 9. **Hardening and extras**, as needed:
     - Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip.
     - Python / polars: export batches through the Arrow C Stream interface, or a polars IO plugin (`register_io_source`) for `scan_fwf`.
@@ -134,23 +139,26 @@ scripts/
 
 ## Input surface
 
-Every input resolves to an ordered list of units, one per file or zip member. Each unit is an in-memory `Slice` or a `Stream`, and the parser only ever sees units.
+Every input resolves to one unit: a file, stdin, bytes, a reader, or one zip member. A unit is an in-memory `Slice` or a `Stream`, and the parser only ever sees units.
 
 ```rust
 pub enum Location  { Path(PathBuf), Stdin, Bytes(Bytes), Reader(Box<dyn Read + Send>) }  // From<&str>, &Path, PathBuf
 pub enum Container { Auto, Plain, Gzip, Zip }          // Auto = check the first bytes
 
-// ReadOptions::new(schema, encoding).with_container(..).with_entries(["parts/*.txt"])?
+// ReadOptions::new(schema, encoding).with_container(..).with_entry("parts/1.txt")
+//     .with_columns(["id", "amount"])?.with_skip_rows(1).with_n_rows(1000)
+//     .with_chunk_size(1 << 20).with_n_threads(4)
 
 pub(crate) struct Unit  { pub name: String, pub input: Input }  // "a.txt", "-", "data.zip!parts/1.txt"
 pub(crate) enum   Input { Slice(Bytes), Stream(Box<dyn Read + Send>) }
 
-pub(crate) fn open(location: Location, container: Container, entries: Option<&GlobSet>) -> Result<Vec<Unit>>;
+pub(crate) fn open(location: Location, container: Container, entry: Option<&str>) -> Result<Unit>;
 pub fn read(location: impl Into<Location>, options: &ReadOptions) -> Result<RecordBatch>;
+pub fn scan(location: impl Into<Location>, options: &ReadOptions) -> Result<Box<dyn RecordBatchReader + Send>>;
 ```
 
-- `Unit` and `Input` stay crate-private until `scan()` needs them. `open` returns a `Vec`: zip units are slices of one mapped archive, so there are no file handles to hold open.
-- `read` parses every unit into one `RecordBatch`, in order, counting records from each unit's start in errors. A `Stream` unit is read a block at a time.
+- `Unit` and `Input` are crate-private; `scan()` didn't need them. A zip member is a slice of the mapped archive, so there are no file handles to hold open.
+- `read` parses the unit into one `RecordBatch`; `scan` yields its batches one chunk at a time. A `Stream` unit is read a block at a time.
 - Units own their data and are `Send + 'static`, so they can move to worker threads later without an API change.
 - In-memory inputs are named `<bytes>` and `<reader>`; stdin is `-`.
 
@@ -158,11 +166,11 @@ pub fn read(location: impl Into<Location>, options: &ReadOptions) -> Result<Reco
 
 1. **Get the raw bytes.** A path, or stdin redirected from a file (its metadata reports a regular file), is memory-mapped and wrapped with `Bytes::from_owner(mmap)`. A pipe on stdin, or a `Reader`, stays a stream. An empty file maps to an empty slice.
 2. **Identify the format** from the first bytes unless a container is given (`with_container`, later `--input-format`): `PK\x03\x04` is zip, `1F 8B` is gzip, anything else is plain. A stream's first bytes are put back in front of it. File extensions are ignored.
-3. **Split into units** as in the table below.
+3. **Choose the unit** as in the table below.
 
 | Source | plain | gzip | zip |
 | --- | --- | --- | --- |
-| file, or `< file` | `Slice` | `Stream` | one unit per member, read from the mapped archive |
+| file, or `< file` | `Slice` | `Stream` | the chosen member, read from the mapped archive |
 | pipe | `Stream` | `Stream` | copy to a temp file, then handle as a file |
 | `Bytes` (library) | `Slice` | `Stream` | handle as a file, over the bytes |
 | `Read` (library) | `Stream` | `Stream` | copy to a temp file, then handle as a file |
@@ -178,11 +186,13 @@ The `zip` crate is used only to read the archive's index. Each member's bytes ar
 - Deflate64 members work the same way, using the `deflate64` crate's decoder.
 - Directories are skipped. Encrypted members and other compression methods are rejected with an error naming the member and the method number.
 - Data that fails its size or CRC-32 is an `Io` error naming the member; `Archive` errors cover the index, encryption, unsupported methods and choosing members.
-- Without entries, an archive must hold exactly one file; otherwise the error lists them. Entry globs use `globset` defaults, so `*` also matches `/`. Matching nothing is an error.
+- Without an entry, an archive must hold exactly one file. With one, the member of exactly that name is read. Otherwise the error lists the archive's files.
 
-### Rules applied per unit
+### Rules applied to a unit
 
-- Apply the header and `skip_rows` to each unit, because each file has its own header.
+- `skip_rows` skips the unit's first lines, such as a header. They aren't parsed, and records in errors still count them, so a record number is a line number.
+- `n_rows` stops after that many records. An in-memory unit is cut after that line before parsing, and a stream stops being read, so nothing past it is parsed or can fail.
+- `columns` chooses fields by name, in the order given; an unknown or repeated name is an error. Other fields cost nothing, since fields are at known positions.
 - A record ends at `\n`, and a `\r` before it is dropped, so `\n`, `\r\n` and mixed endings all work. A final line ending adds no record; a blank line is a record whose fields are all null.
 - Strip a single trailing `0x1A` (DOS end-of-file marker) after the last line ending.
 - An empty unit yields zero rows, not an error.
@@ -205,14 +215,14 @@ Both encodings are single-byte and ASCII-compatible, so a character is one byte,
 ### Command line
 
 ```
-fwf convert [INPUT ...] --layout schema.json
-  INPUT            file path, or '-' for stdin (default '-'); the shell expands globs
+fwf convert [INPUT] --layout schema.json
+  INPUT            file path, or '-' for stdin (default '-')
   --input-format   auto | plain | gzip | zip        (default auto)
-  --entry GLOB     zip members to read, repeatable  (default: the only member)
+  --entry NAME     zip member to read               (default: the only member)
   --encoding       cp1252 | cp850                   (required)
 ```
 
-`-` may appear at most once. Only `--entry` needs our own glob matching (`globset`). Units are processed one after another, each parsed in parallel internally.
+One input for now, like the library.
 
 ## Output surface (deferred)
 
@@ -228,7 +238,7 @@ Not started. These are notes from the discussion to pick up later.
 
 ## Test fixtures
 
-`tests/fixtures/generate.py` writes one set of records in every encoding (cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`), plus `people.cp1252.stored.zip`, `people.cp1252.lzma.zip` (a method to reject) and `people.multi.zip` (a directory, `parts/1.txt`, `parts/2.txt` and `README.txt`, for choosing members). Stdin was checked by hand with pipes and redirects; the tests cover a pipe and a mapped file directly. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run. `.gitattributes` marks the fixtures `-text`, so git never converts their line endings (it would add `\r` on a clone with `core.autocrlf=true`).
+`tests/fixtures/generate.py` writes one set of records in every encoding (cp1252, cp850) and container (`.txt`, `.txt.gz`, deflate `.zip`, deflate64 `.zip`), plus `people.cp1252.stored.zip`, `people.cp1252.lzma.zip` (a method to reject) and `people.multi.zip` (a directory, `parts/1.txt`, `parts/2.txt` and `README.txt`, for choosing a member). Stdin was checked by hand with pipes and redirects; the tests cover a pipe and a mapped file directly. Every data file must decode to `people.expected.json` (blank fields are null) with `people.schema.json`, whose fields carry an extra `description` key that readers must ignore. There, `amount` is `Float64`, `name` is `String` explicitly, and the other fields have no type. `people.schema.unknown-type.json` misspells `Float64` and must be rejected. The script needs `7z` for deflate64 and writes identical bytes on every run. `.gitattributes` marks the fixtures `-text`, so git never converts their line endings (it would add `\r` on a clone with `core.autocrlf=true`).
 
 ## Open questions
 
@@ -238,9 +248,9 @@ Not started. These are notes from the discussion to pick up later.
 - [x] What values can a field's `type` take, and is an unknown `type` an error? `String` or `Float64` (polars names); none means `String`; unknown is an error.
 - [x] Schema files give only position and length. Does the library API still take start–end ranges and widths lists? No, dropped for now.
 - [x] A zip arriving on a pipe: copy to a temp file, try to stream it, or reject it? Copy to a temp file (step 4).
-- [ ] Several inputs or zip members: one output, or one per unit? `read` returns one batch for all units in order; the output side still needs deciding, and one output may want a source-name column.
+- [x] Several inputs or zip members: one output, or one per unit? Neither for now: each read takes one input, and a zip must hold one file or the entry must name it (exactly, not by glob).
 - [ ] Default format on stdout: CSV, or require `--format`? Recommended: CSV.
-- [ ] `String` columns are Arrow `Utf8`, whose 32-bit offsets cap a column at 2 GiB of text. `read()` panics past that when it joins the chunks. Switch to `LargeUtf8` or `Utf8View` (polars' own string type), or leave large files to `scan()`?
+- [x] `String` columns are Arrow `Utf8`, whose 32-bit offsets cap a column at 2 GiB of text. Switch to `LargeUtf8` or `Utf8View`, or leave large files to `scan()`? Leave them to `scan()`: past the cap, `read()` returns `Error::TooLarge`, which says so.
 - [x] Are layout start positions 1-based, as most codebooks write them, or 0-based? 1-based.
 
 ## Out of scope for v1
@@ -252,7 +262,7 @@ Each input item below fits into resolution steps 1–3 later without touching th
 - The command-line tool, until the output work starts.
 - Types other than `String` and `Float64` (integers, dates, decimals).
 - Layouts written as start–end ranges or width lists.
-- Parsing several units at once; it mostly helps zips with many deflated members.
+- Reading several inputs or zip members in one read, and parsing them at once.
 - `--no-mmap`. Mapping can crash (SIGBUS) if the file is truncated mid-read, and network filesystems are another reason to want it.
 - Loading a whole decompressed file into memory to get exact parallel splits.
 - Nested archives, zip methods other than stored, deflate and deflate64, encrypted zips, and standalone zstd or bzip2 files.

@@ -18,12 +18,14 @@ pub(crate) fn arrow_field(field: &Field) -> ArrowField {
 /// Builds one field's column from a chunk's lines, each with its offset in the
 /// chunk. The field's type is matched once, then each type has its own loop.
 /// `position(line, byte)` places a bad value by the index of its line and its
-/// offset in the chunk.
+/// offset in the chunk. It is `dyn` to keep the loops from being generic: with
+/// a generic closure, the compiler once stopped inlining Arrow's `append_value`
+/// into them, and parsing was 10% slower.
 pub(crate) fn column(
     field: &Field,
     lines: &[(usize, &[u8])],
     encoding: Encoding,
-    position: impl Fn(usize, usize) -> Position,
+    position: &dyn Fn(usize, usize) -> Position,
 ) -> Result<ArrayRef> {
     let values = lines.iter().enumerate().map(|(i, &(start, line))| {
         let (at, value) = field::value(line, field.start, field.len);

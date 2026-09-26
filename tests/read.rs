@@ -2,8 +2,10 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use arrow_array::{Array, Float64Array, RecordBatch, StringArray};
+use arrow_schema::ArrowError;
+use arrow_select::concat::concat_batches;
 use fwf::{Container, Encoding, Error, Location, ReadOptions, Schema};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 fn fixture(name: &str) -> PathBuf {
     [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", name]
@@ -78,30 +80,22 @@ fn bytes_and_readers_read_like_files() {
 }
 
 #[test]
-fn entries_choose_zip_members() {
+fn an_entry_chooses_a_zip_member() {
     let multi = fixture("people.multi.zip");
     let err = fwf::read(&*multi, &people(Encoding::Cp850)).unwrap_err();
     assert!(
         err.to_string().ends_with(
             "people.multi.zip: holds 3 files (parts/1.txt, parts/2.txt, README.txt); \
-             choose which to read with entries"
+             choose one with an entry"
         ),
         "{err}"
     );
 
-    let options = people(Encoding::Cp850)
-        .with_entries(["parts/*.txt"])
-        .unwrap();
-    let Value::Array(once) = expected() else {
-        unreachable!()
-    };
-    let twice = Value::Array(once.iter().chain(&once).cloned().collect());
-    assert_eq!(rows(&fwf::read(&*multi, &options).unwrap()), twice);
+    let options = people(Encoding::Cp850).with_entry("parts/2.txt");
+    assert_eq!(rows(&fwf::read(&*multi, &options).unwrap()), expected());
 
     // Errors name the member.
-    let options = people(Encoding::Cp1252)
-        .with_entries(["parts/2.txt"])
-        .unwrap();
+    let options = people(Encoding::Cp1252).with_entry("parts/2.txt");
     let err = fwf::read(&*multi, &options).unwrap_err();
     let Error::InvalidByte { position, .. } = &err else {
         panic!("{err:?}")
@@ -111,17 +105,86 @@ fn entries_choose_zip_members() {
         "{err}"
     );
 
-    let options = people(Encoding::Cp850).with_entries(["*.csv"]).unwrap();
+    // The name must match exactly; it isn't a glob.
+    let options = people(Encoding::Cp850).with_entry("parts/*.txt");
     let err = fwf::read(&*multi, &options).unwrap_err();
     assert!(
-        err.to_string().contains("no file matches the entries"),
+        err.to_string().ends_with(
+            r#"people.multi.zip: has no file named "parts/*.txt" (parts/1.txt, parts/2.txt, README.txt)"#
+        ),
         "{err}"
     );
+}
 
-    let err = people(Encoding::Cp850)
-        .with_entries(["parts/[1.txt"])
+#[test]
+fn columns_choose_fields_in_their_order() {
+    let options = people(Encoding::Cp1252)
+        .with_columns(["amount", "name"])
+        .unwrap();
+    let batch = fwf::read(fixture("people.cp1252.txt"), &options).unwrap();
+    let names: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, ["amount", "name"]);
+    let Value::Array(records) = expected() else {
+        unreachable!()
+    };
+    let chosen = records
+        .iter()
+        .map(|record| json!({"amount": record["amount"], "name": record["name"]}));
+    assert_eq!(rows(&batch), Value::Array(chosen.collect()));
+
+    let err = people(Encoding::Cp1252)
+        .with_columns(["amount", "amonut"])
         .unwrap_err();
-    assert!(matches!(err, Error::InvalidEntryPattern { .. }), "{err:?}");
+    assert_eq!(err.to_string(), r#"column "amonut" isn't in the schema"#);
+    let err = people(Encoding::Cp1252)
+        .with_columns(["name", "name"])
+        .unwrap_err();
+    assert!(matches!(err, Error::DuplicateName { .. }), "{err:?}");
+}
+
+#[test]
+fn scan_yields_a_batch_per_chunk() {
+    // About two records per chunk.
+    let options = people(Encoding::Cp1252).with_chunk_size(100);
+    for file in ["people.cp1252.txt", "people.cp1252.txt.gz"] {
+        let reader = fwf::scan(fixture(file), &options).unwrap();
+        let schema = reader.schema();
+        let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
+        assert!(batches.len() > 1, "{file}");
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(rows(&batch), expected(), "{file}");
+    }
+}
+
+#[test]
+fn scan_reports_parse_errors_through_the_reader() {
+    let options = people(Encoding::Cp1252);
+    let Err(err) = fwf::scan(fixture("no-such-file.txt"), &options) else {
+        panic!("opened a missing file")
+    };
+    assert!(matches!(err, Error::Io { .. }), "{err:?}");
+
+    let reader = fwf::scan(fixture("people.cp850.txt"), &options).unwrap();
+    let results: Vec<_> = reader.collect();
+    let [Err(ArrowError::ExternalError(err))] = &results[..] else {
+        panic!("{results:?}")
+    };
+    let err = err.downcast_ref::<Error>().unwrap();
+    assert!(matches!(err, Error::InvalidByte { .. }), "{err:?}");
+}
+
+#[test]
+fn a_thread_count_reads_the_same_records() {
+    let options = people(Encoding::Cp1252)
+        .with_n_threads(2)
+        .with_chunk_size(1);
+    let batch = fwf::read(fixture("people.cp1252.txt"), &options).unwrap();
+    assert_eq!(rows(&batch), expected());
 }
 
 #[test]
