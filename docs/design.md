@@ -125,6 +125,7 @@ tests/
   cli.rs          the command as a process
 scripts/
   gen_tables.py   writes src/tables.rs from Python's codecs
+  polars_zip_to_parquet.py  the same zip → Parquet conversion in Python with polars, to compare against
 ```
 
 | polars-io `csv/read/` | fwf | What changes |
