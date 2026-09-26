@@ -44,6 +44,11 @@ Rows marked Decided or Dropped are the user's calls; rows marked Agreed were pro
 | Output files | Agreed | Written to a temp file beside the destination, which is renamed over it only when everything is written. The file gets a new file's permissions. | After an error, the destination is as it was. |
 | Closed stdout | Decided | When the reader of stdout closes the pipe, `write()` returns `Error::Write` with a `BrokenPipe` source. The CLI (step 8) exits quietly on it. | Chosen on 2026-09-26, like the terminal check. `fwf … \| head` is ordinary shell use, but a library caller should be able to tell its output was cut short. |
 | CSV writer | Decided | Keep `arrow-csv`. | Chosen on 2026-09-26. A direct writer of about 40 lines wrote the same bytes in 1.64 s instead of 2.87 s on the 301.5 MB file, but fwf would then own CSV quoting and a formatter for every type it adds. |
+| Command | Decided | Plain `fwf`, with no `convert` subcommand. | Chosen on 2026-09-26. Converting is the only thing it does. Adding a verb later would break the command line, since `fwf check` could also be an input named `check`. |
+| Output format | Decided | `--format` if given. Otherwise Parquet when `-o` ends in `.parquet` (in any case), and CSV for anything else, stdout included. | Chosen on 2026-09-26. The name is the only thing that says what the user wants, and `-o out.parquet` writing CSV would be a trap. |
+| Progress | Decided | None for now: stdout carries only data and stderr only errors. | Chosen on 2026-09-26. |
+| CLI rows | Decided | `--skip-rows` and `--n-rows`, as in `ReadOptions`. Column selection isn't exposed. | Chosen on 2026-09-26. |
+| CLI feature | Decided | The binary needs the `cli` feature, which is on by default. Library users who don't want `clap` set `default-features = false`. | Chosen on 2026-09-26, so `cargo install fwf` and `cargo test` include the command. `Encoding`, `Container` and `Format` derive `clap::ValueEnum` only under the feature. |
 
 ## Core architecture
 
@@ -79,7 +84,7 @@ After step 6, on a regenerated file of the same shape (301.5 MB, the same M1, be
 
 ## Crate layout
 
-One library crate, organized like polars-io's `csv/read` module. The command-line tool comes in step 8. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
+One library crate, organized like polars-io's `csv/read` module, and the `fwf` command behind the default `cli` feature. Public names drop polars' `Csv` prefix (`fwf::ReadOptions`), which polars needs only because its prelude puts every format in one namespace.
 
 ```
 src/
@@ -106,10 +111,12 @@ src/
                   RecordBatchReader
   writer.rs       write(batches, format, destination): CSV (arrow-csv) or Parquet (ArrowWriter,
                   zstd) to a file (temp file + rename) or stdout
+  main.rs         the `fwf` command (clap), built with the `cli` feature
 tests/
   fixtures/…
   read.rs         every fixture with people.schema.json == people.expected.json
   write.rs        CSV text, Parquet read back, and what a failed write leaves
+  cli.rs          the command as a process
 scripts/
   gen_tables.py   writes src/tables.rs from Python's codecs
 ```
@@ -129,9 +136,9 @@ scripts/
 
 **Read vs. scan.** Polars' `scan` builds a lazy plan for its query engine; we have none. `scan()` returns an Arrow `RecordBatchReader`, with column selection and `n_rows` as plain options, and `read()` collects the same batches. One `Parser::parse_chunk` does the parsing, fed two ways: in-memory units are split into chunks and parsed in parallel, a few per thread at a time as the reader asks; streamed units are read a block at a time, cut at the last newline, with the rest carried into the next block.
 
-**Dependencies:** `arrow-array`, `arrow-schema`, `arrow-select` and `arrow-csv` (not the full `arrow` crate), `parquet` with only its `arrow` and `zstd` features, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`.
+**Dependencies:** `arrow-array`, `arrow-schema`, `arrow-select` and `arrow-csv` (not the full `arrow` crate), `parquet` with only its `arrow` and `zstd` features, `memchr`, `bytes`, `memmap2`, `flate2`, `zip` without default features (only its index reader), `deflate64`, `crc32fast`, `tempfile`, `serde`, `serde_json` and `rayon`. `clap` with the default `cli` feature.
 
-**Build order**, each step checked against the fixtures. Steps 1–7 are done (as of 2026-09-26); 8 onward is the plan.
+**Build order**, each step checked against the fixtures. Steps 1–8 are done (as of 2026-09-26); 9 is the plan.
 
 1. Done. `schema.rs`: load `people.schema.json`; reject `people.schema.unknown-type.json`.
 2. Done. `encoding.rs` + `tables.rs`: tables checked against Python.
@@ -140,7 +147,7 @@ scripts/
 5. Done. Chunked, parallel, column-at-a-time parsing: in-memory units in chunks of about 1 MiB cut after a line ending, streams a block at a time with the rest of the last line carried over, and error positions kept exact across chunks. Unit tests parse the fixtures with chunks as small as one byte.
 6. Done. `scan(location, &options)` returns an Arrow `RecordBatchReader` yielding one batch per chunk, parsed as it's asked for; `read()` collects the same batches. `ReadOptions` gained `with_columns`, `with_skip_rows`, `with_n_rows`, `with_chunk_size` and `with_n_threads`. Each read takes one unit: `with_entry` names a zip member exactly, replacing `with_entries` globs. Past 2 GiB of text in a column, `read()` returns `Error::TooLarge` instead of panicking.
 7. Done. `write(batches, format, destination)` writes CSV (`arrow-csv`) or Parquet (`parquet::arrow::ArrowWriter`, zstd) to a file or stdout, per Output surface: a temp file renamed into place for files, and a closed pipe on stdout returned as a `BrokenPipe` error.
-8. **Command line.** `fwf convert [INPUT] --layout schema.json --encoding cp1252|cp850 [--input-format] [--entry NAME] [-o OUTPUT] [--format csv|parquet] [--force]`, stdin and stdout by default, progress and errors on stderr. It refuses to write Parquet to a terminal unless given `--force`, and exits quietly when the reader of stdout closes the pipe (`Error::Write` of kind `BrokenPipe`). Behind a cargo feature so library users don't compile `clap`.
+8. Done. The `fwf` command, per Command line: `scan()` into `write()`, stdin and stdout by default, errors on stderr. It refuses to write Parquet to a terminal unless given `--force`, and exits quietly when the reader of stdout closes the pipe. It's built with the `cli` feature, which is on by default.
 9. **Hardening and extras**, as needed:
     - Edge-case fixtures: `\r\n`, a trailing `0x1A`, header rows, short lines, blank lines and a multi-member gzip.
     - Python / polars: export batches through the Arrow C Stream interface, or a polars IO plugin (`register_io_source`) for `scan_fwf`.
@@ -225,14 +232,18 @@ Both encodings are single-byte and ASCII-compatible, so a character is one byte,
 ### Command line
 
 ```
-fwf convert [INPUT] --layout schema.json
-  INPUT            file path, or '-' for stdin (default '-')
+fwf [INPUT] --layout schema.json --encoding cp1252|cp850
+  INPUT            file path, or '-' for stdin      (default '-')
   --input-format   auto | plain | gzip | zip        (default auto)
   --entry NAME     zip member to read               (default: the only member)
-  --encoding       cp1252 | cp850                   (required)
+  --skip-rows N    skip the first N lines           (default 0)
+  --n-rows N       stop after N records             (default: all)
+  -o, --output     file path, or '-' for stdout     (default '-')
+  --format         csv | parquet                    (default: parquet if OUTPUT ends in .parquet, else csv)
+  --force          write Parquet even to a terminal
 ```
 
-One input for now, like the library.
+One input for now, like the library. The command reads with `scan()` and writes with `write()`, so a file is replaced only once everything is written. Stdout carries only data. An error is printed to stderr as `fwf: …` with exit status 1, and a usage error exits with clap's status 2. The layout file's errors are prefixed with its path. Writing Parquet to a terminal is refused before anything is read, unless given `--force`. When the reader of stdout closes the pipe (`fwf … | head`), the command exits 0 without a message.
 
 ## Output surface
 
@@ -271,7 +282,7 @@ Measured after step 7 on the file from step 6 (40 fields, 301.5 MB, the same M1 
 - [x] Schema files give only position and length. Does the library API still take start–end ranges and widths lists? No, dropped for now.
 - [x] A zip arriving on a pipe: copy to a temp file, try to stream it, or reject it? Copy to a temp file (step 4).
 - [x] Several inputs or zip members: one output, or one per unit? Neither for now: each read takes one input, and a zip must hold one file or the entry must name it (exactly, not by glob).
-- [ ] Default format on stdout: CSV, or require `--format`? Recommended: CSV.
+- [x] Default format on stdout: CSV, or require `--format`? CSV, unless `-o` ends in `.parquet`.
 - [x] `String` columns are Arrow `Utf8`, whose 32-bit offsets cap a column at 2 GiB of text. Switch to `LargeUtf8` or `Utf8View`, or leave large files to `scan()`? Leave them to `scan()`: past the cap, `read()` returns `Error::TooLarge`, which says so.
 - [x] Are layout start positions 1-based, as most codebooks write them, or 0-based? 1-based.
 

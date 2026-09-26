@@ -38,6 +38,7 @@ impl From<&str> for Location {
 /// How the input is packaged. `Auto` decides from the first bytes: `PK\x03\x04`
 /// is zip, `1F 8B` is gzip, anything else is plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Container {
     Auto,
     Plain,

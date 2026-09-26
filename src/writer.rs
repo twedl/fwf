@@ -15,6 +15,7 @@ const BUFFER: usize = 1 << 20;
 
 /// The format to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Format {
     /// Comma-separated, with a header row. A null is an empty field.
     Csv,

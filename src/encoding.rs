@@ -7,6 +7,7 @@ use crate::tables::{CP850, CP1252};
 /// Both are single-byte code pages, so a character is one byte and field
 /// positions are byte positions. For UTF-8 files, use polars directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Encoding {
     Cp1252,
     Cp850,
