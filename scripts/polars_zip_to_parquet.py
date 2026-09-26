@@ -57,9 +57,19 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         utf8 = Path(tmp) / "member.txt"
         decode(zip_path, encoding, utf8)
-        pl.scan_lines(utf8).select([column(f) for f in fields]).sink_parquet(
-            out, compression="zstd", compression_level=3
-        )
+        frame = pl.scan_lines(utf8).select([column(f) for f in fields])
+
+        # Change the data here, before it's written. `frame` is a LazyFrame
+        # with the schema's columns, already trimmed and typed. For example,
+        # with tests/fixtures/people.schema.json:
+        #
+        #   frame = frame.drop("code")
+        #   frame = frame.with_columns(pl.col("born").str.to_date("%Y%m%d"))
+        #   frame = frame.with_columns(cents=(pl.col("amount") * 100).round().cast(pl.Int64))
+        #   frame = frame.filter(pl.col("amount") > 0)
+        #   frame = frame.rename({"id": "person_id"})
+
+        frame.sink_parquet(out, compression="zstd", compression_level=3)
 
 
 if __name__ == "__main__":
