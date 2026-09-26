@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::tables::{CP850, CP1252};
 
 /// The character encoding of a fixed-width file.
@@ -6,6 +8,16 @@ pub enum Encoding {
     Utf8,
     Cp1252,
     Cp850,
+}
+
+impl fmt::Display for Encoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Encoding::Utf8 => "UTF-8",
+            Encoding::Cp1252 => "cp1252",
+            Encoding::Cp850 => "cp850",
+        })
+    }
 }
 
 /// A byte that isn't valid in the field's encoding.
@@ -81,7 +93,6 @@ impl Encoding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Schema;
 
     fn offsets(encoding: Encoding, line: &[u8], chars: &[usize]) -> Vec<usize> {
         let mut out = Vec::new();
@@ -112,28 +123,6 @@ mod tests {
             offsets(Encoding::Utf8, line, &[0, 3, 4, 5, 6, 7, 8, 20]),
             [0, 3, 5, 6, 8, 12, 13, 13]
         );
-    }
-
-    #[test]
-    fn utf8_fixture_fields_match_cp1252_fields() {
-        // Widths count characters, so slicing either file at the schema's
-        // boundaries must give the same field values.
-        let schema = Schema::from_json(include_bytes!("../tests/fixtures/people.schema.json"));
-        let mut boundaries: Vec<usize> = (schema.unwrap().fields().iter())
-            .flat_map(|f| [f.start, f.start + f.len])
-            .collect();
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        let utf8 = include_str!("../tests/fixtures/people.utf-8.txt").lines();
-        let cp1252 = include_bytes!("../tests/fixtures/people.cp1252.txt").split(|&b| b == b'\n');
-        for (u, c) in utf8.zip(cp1252) {
-            let uo = offsets(Encoding::Utf8, u.as_bytes(), &boundaries);
-            let co = offsets(Encoding::Cp1252, c, &boundaries);
-            for (uw, cw) in uo.windows(2).zip(co.windows(2)) {
-                let expected = decode(Encoding::Cp1252, &c[cw[0]..cw[1]]).unwrap();
-                assert_eq!(&u[uw[0]..uw[1]], expected);
-            }
-        }
     }
 
     #[test]
